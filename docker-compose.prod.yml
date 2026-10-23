@@ -1,0 +1,142 @@
+# Usage:
+#   cp .env.prod.example .env.prod   # fill in your values
+#   docker compose --env-file .env.prod -f docker-compose.prod.yml up -d
+#
+# Logging:
+#   All services ship their stdout/stderr to systemd-journald via the
+#   `journald` Docker driver. journald applies its own rotation (configure
+#   /etc/systemd/journald.conf — SystemMaxUse=, SystemMaxFileSize=,
+#   MaxRetentionSec=) so logs cannot fill the disk and historical entries
+#   are kept until the retention window expires.
+#
+#   The `tag` option labels each line with CONTAINER_TAG=... so fail2ban
+#   (and `journalctl -t hisaabo-api`) can filter by service. See
+#   docs/fail2ban/README.md for the host-side install steps.
+#
+#   Host must be running systemd (Debian/Ubuntu/RHEL/etc. default — true).
+#   If your host has no systemd, replace each `logging:` block with:
+#       driver: json-file
+#       options: { max-size: "10m", max-file: "5", compress: "true" }
+#   That gives the same disk-cap protection minus the journald features.
+
+# Network exposure:
+#   The API is published on the HOST LOOPBACK only. Put a TLS-terminating reverse
+#   proxy on the same host in front of it (Caddy, nginx using nginx/nginx.conf,
+#   or a Cloudflare Tunnel) and expose only 80/443 publicly. To reach the API
+#   from other hosts deliberately, set API_BIND=0.0.0.0 in .env.prod and firewall
+#   the port; plain HTTP must never be exposed to the internet.
+#
+# Client IP / rate limiting:
+#   The API derives the client IP from forwarding headers only as configured by
+#   TRUST_PROXY_HOPS / TRUST_CLOUDFLARE (see .env.prod.example). The defaults
+#   below assume exactly ONE trusted proxy in front of the API. Set
+#   TRUST_PROXY_HOPS=0 if you publish the API port directly (no proxy).
+#
+# Hardening:
+#   api runs as the unprivileged `node` user with a read-only root filesystem,
+#   all capabilities dropped, and only /tmp (tmpfs) and /storage (volume) writable.
+
+services:
+  api:
+    image: ${HISAABO_API_IMAGE:-ghcr.io/hisaabo/hisaabo-api:latest}
+    restart: unless-stopped
+    ports:
+      - "${API_BIND:-127.0.0.1}:${API_PORT:-3000}:3000"
+    env_file: .env.prod
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-hisaabo}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env.prod}@postgres:5432/${POSTGRES_DB:-hisaabo}
+      NODE_ENV: production
+      PORT: 3000
+      UV_THREADPOOL_SIZE: "8"
+      STORAGE_LOCAL_DIR: /storage/objects
+      TRUST_PROXY_HOPS: ${TRUST_PROXY_HOPS:-1}
+      TRUST_CLOUDFLARE: ${TRUST_CLOUDFLARE:-false}
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+    volumes:
+      - api_storage:/storage
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/health?deep=true"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+    depends_on:
+      postgres:
+        condition: service_healthy
+    logging:
+      driver: journald
+      options:
+        tag: "hisaabo-api"
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    # Only the variables postgres needs — no API secrets (ENCRYPTION_KEY,
+    # RESEND_API_KEY, R2_*, ...) are exposed to this container.
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-hisaabo}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env.prod}
+      POSTGRES_DB: ${POSTGRES_DB:-hisaabo}
+    security_opt:
+      - no-new-privileges:true
+    # The official entrypoint chowns PGDATA and drops to the postgres user.
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETGID
+      - SETUID
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-hisaabo}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    logging:
+      driver: journald
+      options:
+        tag: "hisaabo-postgres"
+
+  backup:
+    build:
+      context: .
+      dockerfile: Dockerfile.backup
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGUSER: ${POSTGRES_USER:-hisaabo}
+      PGPASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env.prod}
+      DB_USER: ${POSTGRES_USER:-hisaabo}
+      BACKUP_ENCRYPTION_KEY: ${BACKUP_ENCRYPTION_KEY:-}
+      R2_ACCESS_KEY_ID: ${R2_ACCESS_KEY_ID:-}
+      R2_SECRET_ACCESS_KEY: ${R2_SECRET_ACCESS_KEY:-}
+      R2_ENDPOINT: ${R2_ENDPOINT:-}
+      R2_BUCKET: ${R2_BUCKET:-hisaabo-backups}
+      BACKUP_CRON: ${BACKUP_CRON:-0 2 * * *}
+      BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-30}
+    volumes:
+      - backup_data:/var/backups/hisaabo
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: journald
+      options:
+        tag: "hisaabo-backup"
+
+volumes:
+  pgdata:
+  backup_data:
+  api_storage:

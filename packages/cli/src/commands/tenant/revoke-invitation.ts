@@ -1,0 +1,36 @@
+import { HisaaboClient, HisaaboApiError } from "../../client.js";
+import { requireAuth } from "../../config.js";
+import { fatalError, success, outputJSON, EXIT } from "../../output.js";
+import { confirmOrExit } from "../../safety.js";
+
+interface RevokeInvitationOpts {
+  yes?: boolean;
+  json?: boolean;
+}
+
+export async function revokeInvitationCommand(invitationId: string, opts: RevokeInvitationOpts): Promise<void> {
+  const cfg = requireAuth();
+  const client = new HisaaboClient(cfg);
+
+  await confirmOrExit(`Revoke invitation ${invitationId}?`, opts);
+
+  try {
+    const result = await client.tenant.revokeInvitation({ invitationId });
+
+    if (opts.json) {
+      outputJSON(result);
+      return;
+    }
+
+    success("Invitation revoked successfully.");
+  } catch (e) {
+    if (e instanceof HisaaboApiError) {
+      const err = e.hisaaboError;
+      if (err.code === "not_found") fatalError(`Invitation not found: ${invitationId}`, EXIT.NOT_FOUND);
+      if (err.code === "unauthorized") fatalError("Session expired. Run: hisaabo login", EXIT.AUTH);
+      if (err.code === "forbidden") fatalError(err.message, EXIT.FORBIDDEN);
+      if (err.code === "network_error") fatalError(err.message, EXIT.NETWORK);
+    }
+    fatalError(String(e instanceof Error ? e.message : e));
+  }
+}

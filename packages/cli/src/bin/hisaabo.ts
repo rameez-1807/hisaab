@@ -1,0 +1,90 @@
+import { Command } from "commander";
+import { fatalError, installTerminalSanitizer, EXIT } from "../output.js";
+import { setTimeZone, InvalidTimeZoneError } from "../format.js";
+
+import { registerAuthCommands } from "./registrars/auth.js";
+import { registerDashboardCommands } from "./registrars/dashboard.js";
+import { registerInvoiceCommands } from "./registrars/invoice.js";
+import { registerPartyCommands } from "./registrars/party.js";
+import { registerItemCommands } from "./registrars/item.js";
+import { registerPaymentCommands } from "./registrars/payment.js";
+import { registerExpenseCommands } from "./registrars/expense.js";
+import { registerGstCommands } from "./registrars/gst.js";
+import { registerReportCommands } from "./registrars/report.js";
+import { registerBankCommands } from "./registrars/bank.js";
+import { registerShipmentCommands } from "./registrars/shipment.js";
+import { registerTargetCommands } from "./registrars/target.js";
+import { registerStoreCommands } from "./registrars/store.js";
+import { registerImportCommands } from "./registrars/import.js";
+import { registerAutomatedInvoiceCommands } from "./registrars/automated-invoice.js";
+import { registerBusinessCommands } from "./registrars/business.js";
+import { registerDocumentCommands } from "./registrars/document.js";
+import { registerTenantCommands } from "./registrars/tenant.js";
+import { registerApiKeyCommands } from "./registrars/api-key.js";
+import { registerSessionCommands } from "./registrars/session.js";
+import { registerJournalCommands } from "./registrars/journal.js";
+import { registerItcCommands } from "./registrars/itc.js";
+import { registerBankReconCommands } from "./registrars/bank-recon.js";
+import { registerEInvoiceCommands } from "./registrars/einvoice.js";
+import { registerEwbCommands } from "./registrars/ewb.js";
+import { registerBackupCommands } from "./registrars/backup.js";
+
+installTerminalSanitizer();
+
+// ── Program ───────────────────────────────────────────────────────────────
+
+const program = new Command();
+
+declare const __CLI_VERSION__: string | undefined;
+const cliVersion = typeof __CLI_VERSION__ !== "undefined" ? __CLI_VERSION__ : "dev";
+
+program
+  .name("hisaabo")
+  .description("Hisaabo CLI — Invoicing and business management")
+  .version(cliVersion)
+  .option("--tz <zone>", "IANA time zone for --from/--to day boundaries (default: HISAABO_TZ, else machine zone)");
+
+// Resolve the time zone once, before any command runs; an invalid --tz/HISAABO_TZ is a usage error.
+program.hook("preAction", (_thisCommand, actionCommand) => {
+  try {
+    setTimeZone(actionCommand.optsWithGlobals<{ tz?: string }>().tz);
+  } catch (err) {
+    if (err instanceof InvalidTimeZoneError) fatalError(err.message, EXIT.USAGE);
+    throw err;
+  }
+});
+
+// ── Register all command groups ───────────────────────────────────────────
+
+registerAuthCommands(program);
+registerDashboardCommands(program);
+registerInvoiceCommands(program);
+registerPartyCommands(program);
+registerItemCommands(program);
+registerPaymentCommands(program);
+registerExpenseCommands(program);
+registerGstCommands(program);
+registerReportCommands(program);
+registerBankCommands(program);
+registerShipmentCommands(program);
+registerTargetCommands(program);
+registerStoreCommands(program);
+registerImportCommands(program);
+registerAutomatedInvoiceCommands(program);
+registerBusinessCommands(program);
+registerDocumentCommands(program);
+registerTenantCommands(program);
+registerApiKeyCommands(program);
+registerSessionCommands(program);
+registerJournalCommands(program);
+registerItcCommands(program);
+registerBankReconCommands(program);
+registerEInvoiceCommands(program);
+registerEwbCommands(program);
+registerBackupCommands(program);
+
+// ── Run ────────────────────────────────────────────────────────────────────
+
+program.parseAsync(process.argv).catch((err) => {
+  fatalError(String(err instanceof Error ? err.message : err));
+});

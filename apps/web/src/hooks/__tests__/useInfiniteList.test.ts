@@ -1,0 +1,473 @@
+/**
+ * useInfiniteList — infinite scroll hook tests.
+ *
+ * Core contract:
+ *   1. Accumulates pages without duplicates.
+ *   2. Cache invalidation (page 1 refetch) merges updates in-place —
+ *      does NOT reset accumulated items (which would cause scroll-to-top).
+ *   3. Filter changes reset the list.
+ *   4. Correctly reports hasMore, loadingMore, lastBatchSize.
+ *   5. Provides a manual loadMore fallback for keyboard/accessibility.
+ */
+
+import { describe, it, expect, vi, beforeEach } from "vitest";
+import { renderHook, act } from "@testing-library/react";
+import { useInfiniteList } from "../useInfiniteList";
+
+// ── Test data ────────────────────────────────────────────────────────────────
+
+function makeItems(start: number, count: number) {
+  return Array.from({ length: count }, (_, i) => ({
+    id: `item-${start + i}`,
+    name: `Item ${start + i}`,
+  }));
+}
+
+const page1 = makeItems(1, 5);
+const page2 = makeItems(6, 5);
+const page3 = makeItems(11, 3);
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+function renderInfiniteList(overrides: Partial<Parameters<typeof useInfiniteList>[0]> = {}) {
+  const onLoadMore = vi.fn();
+  return renderHook(
+    (props) => useInfiniteList(props),
+    {
+      initialProps: {
+        key: "test",
+        data: page1,
+        total: 13,
+        page: 1,
+        isFetching: false,
+        onLoadMore,
+        resetDeps: [],
+        ...overrides,
+      },
+    }
+  );
+}
+
+// ── Tests ────────────────────────────────────────────────────────────────────
+
+describe("useInfiniteList — page accumulation", () => {
+  beforeEach(() => {
+    sessionStorage.clear();
+  });
+
+  it("loads page 1 data on initial render", () => {
+    const { result } = renderInfiniteList();
+    expect(result.current.items).toHaveLength(5);
+    expect(result.current.items[0].id).toBe("item-1");
+    expect(result.current.hasMore).toBe(true);
+    expect(result.current.total).toBe(13);
+  });
+
+  it("accumulates page 2 without duplicating page 1", () => {
+    const { result, rerender } = renderInfiniteList();
+    expect(result.current.items).toHaveLength(5);
+
+    // Simulate page 2 load
+    rerender({
+      key: "test",
+      data: page2,
+      total: 13,
+      page: 2,
+      isFetching: false,
+      onLoadMore: vi.fn(),
+      resetDeps: [],
+    });
+
+    expect(result.current.items).toHaveLength(10);
+    expect(result.current.items[0].id).toBe("item-1");
+    expect(result.current.items[5].id).toBe("item-6");
+    expect(result.current.hasMore).toBe(true);
+  });
+
+  it("reports hasMore=false when all items loaded", () => {
+    const { result, rerender } = renderInfiniteList();
+
+    rerender({
+      key: "test", data: page2, total: 13, page: 2,
+      isFetching: false, onLoadMore: vi.fn(), resetDeps: [],
+    });
+    rerender({
+      key: "test", data: page3, total: 13, page: 3,
+      isFetching: false, onLoadMore: vi.fn(), resetDeps: [],
+    });
+
+    expect(result.current.items).toHaveLength(13);
+    expect(result.current.hasMore).toBe(false);
+  });
+
+  it("deduplicates items by ID when page data overlaps", () => {
+    const { result, rerender } = renderInfiniteList();
+
+    // Page 2 has one overlapping item
+    const overlapping = [{ id: "item-5", name: "Item 5" }, ...makeItems(6, 4)];
+    rerender({
+      key: "test", data: overlapping, total: 13, page: 2,
+      isFetching: false, onLoadMore: vi.fn(), resetDeps: [],
+    });
+
+    expect(result.current.items).toHaveLength(9); // 5 + 4 new (not 5 + 5)
+  });
+});
+
+describe("useInfiniteList — cache invalidation (scroll stability)", () => {
+  beforeEach(() => {
+    sessionStorage.clear();
+  });
+
+  it("does NOT reset accumulated items when page 1 is refetched after invalidation", () => {
+    const { result, rerender } = renderInfiniteList();
+
+    // Load page 2
+    rerender({
+      key: "test", data: page2, total: 13, page: 2,
+      isFetching: false, onLoadMore: vi.fn(), resetDeps: [],
+    });
+    expect(result.current.items).toHaveLength(10);
+
+    // Simulate cache invalidation: page 1 refetched
+    const updatedPage1 = page1.map((item) =>
+      item.id === "item-1" ? { ...item, name: "Updated Item 1" } : item
+    );
+    rerender({
+      key: "test", data: updatedPage1, total: 13, page: 1,
+      isFetching: false, onLoadMore: vi.fn(), resetDeps: [],
+    });
+
+    // Should still have 10 items (NOT reset to 5)
+    expect(result.current.items).toHaveLength(10);
+    // The updated item should be merged in-place
+    expect((result.current.items[0] as any).name).toBe("Updated Item 1");
+    // Page 2 items still present
+    expect(result.current.items[5].id).toBe("item-6");
+  });
+
+  it("preserves item order during cache invalidation merge", () => {
+    const { result, rerender } = renderInfiniteList();
+
+    rerender({
+      key: "test", data: page2, total: 13, page: 2,
+      isFetching: false, onLoadMore: vi.fn(), resetDeps: [],
+    });
+
+    // Refetch page 1 with no changes
+    rerender({
+      key: "test", data: page1, total: 13, page: 1,
+      isFetching: false, onLoadMore: vi.fn(), resetDeps: [],
+    });
+
+    // Order preserved: items 1-5 then 6-10
+    const ids = result.current.items.map((i) => i.id);
+    expect(ids).toEqual([
+      "item-1", "item-2", "item-3", "item-4", "item-5",
+      "item-6", "item-7", "item-8", "item-9", "item-10",
+    ]);
+  });
+
+  it("prepends newly created items when page 1 is refetched after cache invalidation", () => {
+    const { result, rerender } = renderInfiniteList();
+
+    // Accumulate pages 1 + 2 (10 items total)
+    rerender({
+      key: "test", data: page2, total: 13, page: 2,
+      isFetching: false, onLoadMore: vi.fn(), resetDeps: [],
+    });
+    expect(result.current.items).toHaveLength(10);
+
+    // Simulate: user creates a new invoice. Cache invalidation refetches page 1
+    // with a new record at the top (lists are sorted newest-first).
+    const newItem = { id: "item-99", name: "Freshly Created" };
+    const refreshedPage1 = [newItem, ...page1.slice(0, 4)]; // new item bumps out item-5 from page 1
+    rerender({
+      key: "test", data: refreshedPage1, total: 14, page: 1,
+      isFetching: false, onLoadMore: vi.fn(), resetDeps: [],
+    });
+
+    // 10 previous + 1 new = 11 total
+    expect(result.current.items).toHaveLength(11);
+    // New item appears at the top
+    expect(result.current.items[0].id).toBe("item-99");
+    // Other items kept in their previous positions (scroll stability)
+    expect(result.current.items[1].id).toBe("item-1");
+    expect(result.current.items[5].id).toBe("item-5");
+    expect(result.current.items[6].id).toBe("item-6");
+    expect(result.current.items[10].id).toBe("item-10");
+    // lastBatchSize reflects the one new item that arrived via invalidation
+    expect(result.current.lastBatchSize).toBe(1);
+  });
+
+  it("updates in place AND prepends new items in the same refetch", () => {
+    const { result, rerender } = renderInfiniteList();
+
+    // Accumulate pages 1 + 2
+    rerender({
+      key: "test", data: page2, total: 13, page: 2,
+      isFetching: false, onLoadMore: vi.fn(), resetDeps: [],
+    });
+    expect(result.current.items).toHaveLength(10);
+
+    // Page 1 refetch: item-99 is new; item-1 has an updated name.
+    const newItem = { id: "item-99", name: "Freshly Created" };
+    const updatedItem1 = { id: "item-1", name: "Updated Item 1" };
+    const refreshedPage1 = [
+      newItem,
+      updatedItem1,
+      ...page1.slice(1, 4), // items 2, 3, 4
+    ];
+    rerender({
+      key: "test", data: refreshedPage1, total: 14, page: 1,
+      isFetching: false, onLoadMore: vi.fn(), resetDeps: [],
+    });
+
+    // 10 previous + 1 new = 11
+    expect(result.current.items).toHaveLength(11);
+    // New item at the top
+    expect(result.current.items[0].id).toBe("item-99");
+    // Updated item merged in place at its previous position (index 1 after prepend)
+    expect(result.current.items[1].id).toBe("item-1");
+    expect((result.current.items[1] as any).name).toBe("Updated Item 1");
+    // Items that were NOT in the fresh page 1 payload are untouched (e.g., item-5)
+    expect(result.current.items[5].id).toBe("item-5");
+    // Page 2 items preserved
+    expect(result.current.items[6].id).toBe("item-6");
+    expect(result.current.items[10].id).toBe("item-10");
+    // lastBatchSize reflects only new items, not updates
+    expect(result.current.lastBatchSize).toBe(1);
+  });
+});
+
+describe("useInfiniteList — filter reset", () => {
+  beforeEach(() => {
+    sessionStorage.clear();
+  });
+
+  it("resets accumulated items when resetDeps change", () => {
+    const { result, rerender } = renderInfiniteList({ resetDeps: ["filter-a"] });
+
+    // Accumulate some data
+    rerender({
+      key: "test", data: page2, total: 13, page: 2,
+      isFetching: false, onLoadMore: vi.fn(), resetDeps: ["filter-a"],
+    });
+    expect(result.current.items).toHaveLength(10);
+
+    // Change filter — should reset
+    rerender({
+      key: "test", data: makeItems(100, 3), total: 3, page: 1,
+      isFetching: false, onLoadMore: vi.fn(), resetDeps: ["filter-b"],
+    });
+
+    expect(result.current.items).toHaveLength(3);
+    expect(result.current.items[0].id).toBe("item-100");
+  });
+});
+
+describe("useInfiniteList — loading states", () => {
+  beforeEach(() => {
+    sessionStorage.clear();
+  });
+
+  it("reports loadingMore=true when fetching with existing items", () => {
+    const { result, rerender } = renderInfiniteList();
+
+    rerender({
+      key: "test", data: page1, total: 13, page: 1,
+      isFetching: true, onLoadMore: vi.fn(), resetDeps: [],
+    });
+
+    expect(result.current.loadingMore).toBe(true);
+  });
+
+  it("reports loadingMore=false on initial load (no items yet)", () => {
+    const { result } = renderInfiniteList({ data: undefined, isFetching: true });
+    expect(result.current.loadingMore).toBe(false);
+  });
+
+  it("tracks lastBatchSize for aria-live announcements", () => {
+    const { result, rerender } = renderInfiniteList();
+    expect(result.current.lastBatchSize).toBe(5);
+
+    rerender({
+      key: "test", data: page3, total: 13, page: 3,
+      isFetching: false, onLoadMore: vi.fn(), resetDeps: [],
+    });
+    expect(result.current.lastBatchSize).toBe(3);
+  });
+});
+
+describe("useInfiniteList — removeItem", () => {
+  beforeEach(() => {
+    sessionStorage.clear();
+  });
+
+  it("removes an item optimistically by ID", () => {
+    const { result } = renderInfiniteList();
+    expect(result.current.items).toHaveLength(5);
+
+    act(() => {
+      result.current.removeItem("item-3");
+    });
+
+    expect(result.current.items).toHaveLength(4);
+    expect(result.current.items.find((i) => i.id === "item-3")).toBeUndefined();
+  });
+});
+
+describe("useInfiniteList — loadMore (accessibility fallback)", () => {
+  beforeEach(() => {
+    sessionStorage.clear();
+  });
+
+  it("calls onLoadMore when loadMore is invoked and hasMore is true", () => {
+    const onLoadMore = vi.fn();
+    const { result } = renderInfiniteList({ onLoadMore });
+
+    act(() => {
+      result.current.loadMore();
+    });
+
+    expect(onLoadMore).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not call onLoadMore when all items are loaded", () => {
+    const onLoadMore = vi.fn();
+    const { result } = renderInfiniteList({
+      onLoadMore,
+      data: makeItems(1, 3),
+      total: 3,
+    });
+
+    act(() => {
+      result.current.loadMore();
+    });
+
+    expect(onLoadMore).not.toHaveBeenCalled();
+  });
+});
+
+describe("useInfiniteList — scroll/depth restore", () => {
+  beforeEach(() => {
+    sessionStorage.clear();
+    vi.stubGlobal("requestAnimationFrame", (cb: FrameRequestCallback) => {
+      cb(0);
+      return 0;
+    });
+  });
+
+  type Props = Parameters<typeof useInfiniteList>[0];
+
+  /** Mounts with no data, attaches a scroll container, then supplies data. */
+  function mountWithContainer(initial: Partial<Props> = {}) {
+    const onLoadMore = vi.fn();
+    const base: Props = {
+      key: "test", data: undefined, total: 13, page: 1,
+      isFetching: true, onLoadMore, resetDeps: ["a"], ...initial,
+    };
+    const hook = renderHook((props: Props) => useInfiniteList(props), { initialProps: base });
+    const el = document.createElement("div");
+    (hook.result.current.scrollRef as { current: HTMLDivElement | null }).current = el;
+    return { ...hook, el, onLoadMore, base };
+  }
+
+  /**
+   * Seeds saved state through the hook's own save path (onScroll) by mounting a
+   * throwaway instance with the given filter signature and scroll state.
+   */
+  function save(state: { scrollTop: number; itemCount: number }, resetDeps: unknown[] = ["a"]) {
+    const seed = renderHook((props: Props) => useInfiniteList(props), {
+      initialProps: {
+        key: "test", data: makeItems(1, state.itemCount), total: state.itemCount, page: 1,
+        isFetching: false, onLoadMore: vi.fn(), resetDeps,
+      } as Props,
+    });
+    const el = document.createElement("div");
+    el.scrollTop = state.scrollTop;
+    (seed.result.current.scrollRef as { current: HTMLDivElement | null }).current = el;
+    act(() => seed.result.current.onScroll());
+    seed.unmount();
+  }
+
+  it("keeps saved state on mount and restores scroll once depth is reached", () => {
+    save({ scrollTop: 120, itemCount: 5 });
+    const { el, rerender, base } = mountWithContainer();
+    expect(sessionStorage.getItem("hisaabo-scroll-test")).not.toBeNull();
+    rerender({ ...base, data: page1, isFetching: false });
+    expect(el.scrollTop).toBe(120);
+  });
+
+  it("loads more pages until the saved depth is reached", () => {
+    save({ scrollTop: 50, itemCount: 10 });
+    const { el, rerender, base, onLoadMore } = mountWithContainer();
+    rerender({ ...base, data: page1, isFetching: false });
+    expect(onLoadMore).toHaveBeenCalledTimes(1);
+    expect(el.scrollTop).toBe(0);
+    rerender({ ...base, data: page2, page: 2, isFetching: false });
+    expect(el.scrollTop).toBe(50);
+    expect(onLoadMore).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not keep loading when the total shrank below the saved depth", () => {
+    save({ scrollTop: 80, itemCount: 20 });
+    const { el, rerender, base, onLoadMore } = mountWithContainer({ total: 5 });
+    rerender({ ...base, total: 5, data: page1, isFetching: false });
+    expect(onLoadMore).not.toHaveBeenCalled();
+    expect(el.scrollTop).toBe(80);
+  });
+
+  it("stops when a requested page adds no new items", () => {
+    save({ scrollTop: 80, itemCount: 20 });
+    const { el, rerender, base, onLoadMore } = mountWithContainer({ total: 30 });
+    rerender({ ...base, total: 30, data: page1, isFetching: false });
+    expect(onLoadMore).toHaveBeenCalledTimes(1);
+    rerender({ ...base, total: 30, data: page1, page: 2, isFetching: true });
+    rerender({ ...base, total: 30, data: page1, page: 2, isFetching: false });
+    expect(onLoadMore).toHaveBeenCalledTimes(1);
+    expect(el.scrollTop).toBe(80);
+  });
+
+  it("never persists filter values in sessionStorage", () => {
+    save({ scrollTop: 10, itemCount: 5 }, ["secret search text"]);
+    expect(sessionStorage.getItem("hisaabo-scroll-test")).not.toContain("secret");
+    expect(JSON.parse(sessionStorage.getItem("hisaabo-scroll-test")!)).toEqual({ scrollTop: 10, itemCount: 5 });
+  });
+
+  it("skips restore when no in-memory signature exists (e.g. after reload)", () => {
+    sessionStorage.setItem("hisaabo-scroll-reload-test", JSON.stringify({ scrollTop: 120, itemCount: 10 }));
+    const { el, rerender, base, onLoadMore } = mountWithContainer({ key: "reload-test" });
+    rerender({ ...base, data: page1, isFetching: false });
+    expect(onLoadMore).not.toHaveBeenCalled();
+    expect(el.scrollTop).toBe(0);
+  });
+
+  it("skips restore when the filter signature does not match", () => {
+    save({ scrollTop: 120, itemCount: 10 }, ["b"]);
+    const { el, rerender, base, onLoadMore } = mountWithContainer();
+    rerender({ ...base, data: page1, isFetching: false });
+    expect(onLoadMore).not.toHaveBeenCalled();
+    expect(el.scrollTop).toBe(0);
+  });
+
+  it("still resets and clears saved state on a real filter change after mount", () => {
+    save({ scrollTop: 120, itemCount: 5 });
+    const { result, rerender, base } = mountWithContainer();
+    rerender({ ...base, data: page1, isFetching: false });
+    rerender({ ...base, data: makeItems(100, 3), total: 3, isFetching: false, resetDeps: ["b"] });
+    expect(result.current.items.map((i) => i.id)).toEqual(["item-100", "item-101", "item-102"]);
+    expect(sessionStorage.getItem("hisaabo-scroll-test")).toBeNull();
+  });
+
+  it("ignores placeholder data so stale rows of the old filter never appear", () => {
+    const { result, rerender, base } = mountWithContainer({ resetDeps: ["a"] });
+    rerender({ ...base, data: page1, isFetching: false });
+    rerender({ ...base, data: page2, page: 2, isFetching: false });
+    // Filter changes: placeholder (old data) still served at page 1
+    rerender({ ...base, data: page2, page: 1, isFetching: true, isPlaceholderData: true, resetDeps: ["b"] });
+    expect(result.current.items).toHaveLength(0);
+    rerender({ ...base, data: makeItems(100, 2), total: 2, page: 1, isFetching: false, isPlaceholderData: false, resetDeps: ["b"] });
+    expect(result.current.items.map((i) => i.id)).toEqual(["item-100", "item-101"]);
+  });
+});

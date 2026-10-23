@@ -1,0 +1,484 @@
+import {
+  useId,
+  useRef,
+  useState,
+  useEffect,
+  useCallback,
+  KeyboardEvent,
+  ChangeEvent,
+} from "react";
+import { cn } from "@/lib/utils";
+
+export interface ComboboxOption {
+  value: string;
+  label: string;
+  description?: string;
+}
+
+export interface ComboboxProps {
+  value: string;
+  onChange: (value: string) => void;
+  options: ComboboxOption[];
+  placeholder?: string;
+  label?: string;
+  required?: boolean;
+  error?: string;
+  className?: string;
+  emptyMessage?: string;
+  /** Called with the raw text input value — use this for server-side search */
+  onQueryChange?: (query: string) => void;
+  /** Show a loading indicator while server-side results are fetching */
+  isLoading?: boolean;
+  /** When provided, renders a sticky "Create new" action at the bottom of the listbox.
+   *  Called with the current search query text. */
+  onCreateNew?: (query: string) => void;
+  /** Label for the create-new action. Defaults to "Create new". */
+  createNewLabel?: string;
+  /** Mark the combobox input as the dialog's preferred autofocus target. */
+  autoFocus?: boolean;
+}
+
+export function Combobox({
+  value,
+  onChange,
+  options,
+  placeholder = "Search...",
+  label,
+  required,
+  error,
+  className,
+  emptyMessage = "No results found",
+  onQueryChange,
+  isLoading,
+  onCreateNew,
+  createNewLabel = "Create new",
+  autoFocus,
+}: ComboboxProps) {
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState("");
+  const [activeIndex, setActiveIndex] = useState(0);
+
+  const inputRef = useRef<HTMLInputElement>(null);
+  const listboxRef = useRef<HTMLUListElement>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
+
+  const uid = useId();
+  const listboxId = `combobox-listbox-${uid}`;
+  const labelId = `combobox-label-${uid}`;
+
+  const selectedOption = options.find((o) => o.value === value) ?? null;
+
+  // Filter options based on query — when onQueryChange is provided (server-side search),
+  // skip client-side filtering and show all supplied options.
+  const filteredOptions = onQueryChange
+    ? options
+    : query
+    ? options.filter((o) => {
+        const q = query.toLowerCase();
+        return (
+          o.label.toLowerCase().includes(q) ||
+          (o.description?.toLowerCase().includes(q) ?? false)
+        );
+      })
+    : options;
+
+  // When query changes, reset active index
+  useEffect(() => {
+    setActiveIndex(0);
+  }, [query]);
+
+  // Scroll active option into view
+  useEffect(() => {
+    if (!open || activeIndex < 0) return;
+    const optionEl = listboxRef.current?.querySelector(
+      `[id="${uid}-cb-option-${activeIndex}"]`
+    ) as HTMLElement | null;
+    optionEl?.scrollIntoView({ block: "nearest" });
+  }, [activeIndex, open, uid]);
+
+  const openDropdown = () => setOpen(true);
+
+  const closeDropdown = useCallback(() => {
+    setOpen(false);
+    // If nothing was selected or query doesn't match selection, reset query
+    if (!value) {
+      setQuery("");
+    } else if (selectedOption) {
+      setQuery("");
+    }
+  }, [value, selectedOption]);
+
+  // Close on outside click
+  useEffect(() => {
+    if (!open) return;
+    const handler = (e: MouseEvent) => {
+      if (
+        containerRef.current &&
+        !containerRef.current.contains(e.target as Node)
+      ) {
+        closeDropdown();
+      }
+    };
+    document.addEventListener("mousedown", handler);
+    return () => document.removeEventListener("mousedown", handler);
+  }, [open, closeDropdown]);
+
+  const selectOption = useCallback(
+    (index: number) => {
+      if (index >= 0 && index < filteredOptions.length) {
+        onChange(filteredOptions[index].value);
+        setQuery("");
+        setOpen(false);
+        inputRef.current?.blur();
+      }
+    },
+    [filteredOptions, onChange]
+  );
+
+  const clearSelection = useCallback(() => {
+    onChange("");
+    setQuery("");
+    inputRef.current?.focus();
+  }, [onChange]);
+
+  const handleInputChange = (e: ChangeEvent<HTMLInputElement>) => {
+    setQuery(e.target.value);
+    onQueryChange?.(e.target.value);
+    if (!open) openDropdown();
+  };
+
+  const handleInputFocus = () => {
+    // When focusing into a field that already has a selection, show the
+    // selected label as editable text instead of blanking the input.
+    // Without this, the value visually disappears the moment the field is
+    // focused (and the open-on-focus dropdown obscures the selection),
+    // which users perceive as the item name being lost.
+    if (value && selectedOption && !query) {
+      setQuery(selectedOption.label);
+      // Select the text so the user can immediately overwrite it. Skip the
+      // onQueryChange call — we already have the matching option locally
+      // and don't want to trigger a redundant server search for the same
+      // label that's already selected.
+      requestAnimationFrame(() => inputRef.current?.select());
+      // Don't auto-open the dropdown when a selection already exists — Tab
+      // cycling through the form would otherwise re-open the picker every
+      // time focus lands here, which feels like the field is "sticky".
+      // Users who want to change the selection can press ArrowDown, type,
+      // or click the chevron.
+      return;
+    }
+    openDropdown();
+  };
+
+  // The "create new" action counts as one extra navigable slot after the options
+  const hasCreateNew = !!onCreateNew;
+  const totalNavigableItems = filteredOptions.length + (hasCreateNew ? 1 : 0);
+  const createNewIndex = filteredOptions.length; // virtual index for the "create" row
+
+  const handleKeyDown = (e: KeyboardEvent<HTMLInputElement>) => {
+    switch (e.key) {
+      case "ArrowDown":
+        e.preventDefault();
+        if (!open) {
+          openDropdown();
+        } else {
+          setActiveIndex((i) => Math.min(i + 1, totalNavigableItems - 1));
+        }
+        break;
+      case "ArrowUp":
+        e.preventDefault();
+        setActiveIndex((i) => Math.max(i - 1, 0));
+        break;
+      case "Home":
+        e.preventDefault();
+        setActiveIndex(0);
+        break;
+      case "End":
+        e.preventDefault();
+        setActiveIndex(totalNavigableItems - 1);
+        break;
+      case "Enter":
+        e.preventDefault();
+        if (open) {
+          if (hasCreateNew && activeIndex === createNewIndex) {
+            onCreateNew(query);
+            setOpen(false);
+          } else if (filteredOptions.length > 0) {
+            selectOption(activeIndex);
+          }
+        }
+        break;
+      case "Escape":
+        e.preventDefault();
+        if (open) {
+          setOpen(false);
+          setQuery("");
+        }
+        break;
+      case "Backspace":
+        // Keyboard-only deselect. Triggered when the field is showing the
+        // unmodified selected label (either empty query, or query still
+        // equals the label because the user just focused in and hasn't
+        // typed yet — see handleInputFocus).
+        if (value && (query === "" || query === selectedOption?.label)) {
+          e.preventDefault();
+          clearSelection();
+        }
+        break;
+      default:
+        break;
+    }
+  };
+
+  const displayValue = open
+    ? query
+    : selectedOption
+    ? selectedOption.label
+    : query;
+
+  const activeDescendant =
+    open && filteredOptions.length > 0
+      ? `${uid}-cb-option-${activeIndex}`
+      : undefined;
+
+  return (
+    <div ref={containerRef} className={cn("relative", className)}>
+      {label && (
+        <label
+          id={labelId}
+          className="label"
+          htmlFor={`${uid}-cb-input`}
+        >
+          {label}
+          {required && (
+            <span className="ml-0.5 text-red-600">
+              *
+            </span>
+          )}
+        </label>
+      )}
+
+      <div className="relative">
+        <input
+          ref={inputRef}
+          id={`${uid}-cb-input`}
+          role="combobox"
+          aria-haspopup="listbox"
+          aria-expanded={open}
+          aria-controls={listboxId}
+          aria-activedescendant={activeDescendant}
+          aria-autocomplete="list"
+          aria-labelledby={label ? labelId : undefined}
+          autoComplete="off"
+          type="text"
+          value={displayValue}
+          onChange={handleInputChange}
+          onFocus={handleInputFocus}
+          onMouseDown={() => {
+            // Click reliably opens the dropdown, even when a selection
+            // exists (focus alone intentionally doesn't, to avoid Tab
+            // cycling re-opening the picker).
+            if (!open) openDropdown();
+          }}
+          onKeyDown={handleKeyDown}
+          placeholder={placeholder}
+          data-autofocus={autoFocus ? "" : undefined}
+          className={cn(
+            "input pr-8",
+            error && "border-red-500 focus:border-red-500"
+          )}
+        />
+        <div className="absolute inset-y-0 right-2 flex items-center pointer-events-none">
+          {value ? (
+            <button
+              type="button"
+              className="pointer-events-auto p-0.5 rounded text-text-tertiary"
+              tabIndex={-1}
+              onMouseDown={(e) => {
+                e.preventDefault();
+                clearSelection();
+              }}
+              aria-label="Clear selection"
+            >
+              <XIcon className="w-3.5 h-3.5" />
+            </button>
+          ) : (
+            <ChevronDownIcon
+              className={cn(
+                "w-4 h-4 transition-transform duration-150 text-text-tertiary",
+                open && "rotate-180"
+              )}
+            />
+          )}
+        </div>
+      </div>
+
+      {error && (
+        <p className="mt-1 text-xs text-red-600">
+          {error}
+        </p>
+      )}
+
+      {open && (
+        <ul
+          ref={listboxRef}
+          id={listboxId}
+          role="listbox"
+          aria-labelledby={label ? labelId : undefined}
+          className="absolute z-50 left-0 right-0 mt-1 rounded-lg border border-border shadow-dropdown bg-surface-0 max-h-60 overflow-y-auto animate-scale-in"
+        >
+          {isLoading ? (
+            <li className="px-3 py-2 text-sm text-text-tertiary flex items-center gap-2" role="option" aria-selected={false}>
+              <div className="w-3.5 h-3.5 border-2 border-current border-t-transparent rounded-full animate-spin shrink-0" />
+              Searching...
+            </li>
+          ) : (
+            <>
+              {filteredOptions.length === 0 && !hasCreateNew && (
+                <li
+                  className="px-3 py-2 text-sm text-text-tertiary"
+                  role="option"
+                  aria-selected={false}
+                >
+                  {emptyMessage}
+                </li>
+              )}
+              {filteredOptions.length === 0 && hasCreateNew && (
+                <li
+                  className="px-3 py-1.5 text-xs text-text-tertiary"
+                  role="presentation"
+                >
+                  No matches found
+                </li>
+              )}
+              {filteredOptions.map((option, index) => {
+                const isSelected = option.value === value;
+                const isActive = index === activeIndex;
+                return (
+                  <li
+                    key={option.value}
+                    id={`${uid}-cb-option-${index}`}
+                    role="option"
+                    aria-selected={isSelected}
+                    className={cn(
+                      "px-3 py-2 text-sm cursor-pointer flex items-center justify-between gap-2",
+                      isActive && "bg-surface-2",
+                      !isActive && "hover:bg-surface-1",
+                      isSelected && "font-medium text-brand-700"
+                    )}
+                    onMouseEnter={() => setActiveIndex(index)}
+                    onMouseDown={(e) => {
+                      e.preventDefault();
+                      selectOption(index);
+                    }}
+                  >
+                    <span className="flex-1 min-w-0">
+                      <span className="block truncate">{option.label}</span>
+                      {option.description && (
+                        <span className="block text-xs truncate text-text-tertiary">
+                          {option.description}
+                        </span>
+                      )}
+                    </span>
+                    {isSelected && (
+                      <CheckIcon className="w-4 h-4 shrink-0 text-brand-600" />
+                    )}
+                  </li>
+                );
+              })}
+              {hasCreateNew && (
+                <li
+                  id={`${uid}-cb-option-${createNewIndex}`}
+                  role="option"
+                  aria-selected={false}
+                  className={cn(
+                    "px-3 py-2 text-sm cursor-pointer flex items-center gap-2 font-medium text-brand-600 border-t border-border-light",
+                    activeIndex === createNewIndex && "bg-surface-2",
+                    activeIndex !== createNewIndex && "hover:bg-surface-1"
+                  )}
+                  onMouseEnter={() => setActiveIndex(createNewIndex)}
+                  onMouseDown={(e) => {
+                    e.preventDefault();
+                    onCreateNew(query);
+                    setOpen(false);
+                  }}
+                >
+                  <PlusIcon className="w-3.5 h-3.5 shrink-0" />
+                  <span className="truncate">
+                    {query.trim()
+                      ? `${createNewLabel} "${query.trim()}"`
+                      : createNewLabel}
+                  </span>
+                </li>
+              )}
+            </>
+          )}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+function ChevronDownIcon({
+  className,
+}: {
+  className?: string;
+}) {
+  return (
+    <svg
+      className={className}
+      xmlns="http://www.w3.org/2000/svg"
+      fill="none"
+      viewBox="0 0 24 24"
+      stroke="currentColor"
+      strokeWidth={2}
+    >
+      <path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" />
+    </svg>
+  );
+}
+
+function CheckIcon({ className }: { className?: string }) {
+  return (
+    <svg
+      className={className}
+      xmlns="http://www.w3.org/2000/svg"
+      fill="none"
+      viewBox="0 0 24 24"
+      stroke="currentColor"
+      strokeWidth={2.5}
+    >
+      <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
+    </svg>
+  );
+}
+
+function XIcon({ className }: { className?: string }) {
+  return (
+    <svg
+      className={className}
+      xmlns="http://www.w3.org/2000/svg"
+      fill="none"
+      viewBox="0 0 24 24"
+      stroke="currentColor"
+      strokeWidth={2.5}
+    >
+      <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+    </svg>
+  );
+}
+
+function PlusIcon({ className }: { className?: string }) {
+  return (
+    <svg
+      className={className}
+      xmlns="http://www.w3.org/2000/svg"
+      fill="none"
+      viewBox="0 0 24 24"
+      stroke="currentColor"
+      strokeWidth={2.5}
+    >
+      <path strokeLinecap="round" strokeLinejoin="round" d="M12 4v16m8-8H4" />
+    </svg>
+  );
+}

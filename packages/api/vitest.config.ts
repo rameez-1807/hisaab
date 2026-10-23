@@ -1,0 +1,28 @@
+import { defineConfig } from "vitest/config";
+
+export default defineConfig({
+  test: {
+    globals: true,
+    // Run tests sequentially to avoid DB contention when using a shared test DB.
+    // If we ever switch to per-test transaction rollbacks this can be changed to pool mode.
+    pool: "forks",
+    maxWorkers: 1,
+    // Allow longer timeouts for tests that hit a real PostgreSQL database.
+    testTimeout: 15000,
+    hookTimeout: 15000,
+    // env-setup.ts must be first — it sets DATABASE_URL before any module
+    // (including @hisaabo/db) is evaluated and opens its postgres.js connections.
+    setupFiles: [
+      "./src/__tests__/helpers/env-setup.ts",
+      // After env-setup: global beforeEach(resetAllCaches).
+      "./src/__tests__/helpers/cache-setup.ts",
+    ],
+    coverage: {
+      provider: "v8",
+      reporter: ["text", "lcov"],
+      reportsDirectory: "./coverage",
+      include: ["src/**/*.ts"],
+      exclude: ["src/__tests__/**", "src/**/*.test.ts"],
+    },
+  },
+});

@@ -1,0 +1,149 @@
+import { createFileRoute, useNavigate } from "@tanstack/react-router";
+import { useEffect, useRef, useState } from "react";
+import { trpc } from "@/lib/trpc";
+import { Logo } from "@/components/ui/Logo";
+import { isDesktop } from "@/lib/isDesktop";
+import { saveDesktopToken } from "@/lib/desktop-session";
+import { peekNativeRequest } from "@/lib/native-login";
+
+export const Route = createFileRoute("/auth/verify")({
+  component: VerifyPage,
+});
+
+function VerifyPage() {
+  const navigate = useNavigate();
+  const utils = trpc.useUtils();
+  const [error, setError] = useState<string | null>(null);
+  // Capture the token ONCE from the URL at mount, before the effect
+  // strips the query string for Referer safety. Lazy init keeps the values
+  // available after history.replaceState has cleared window.location.search.
+  const [token] = useState(() =>
+    new URLSearchParams(window.location.search).get("token")
+  );
+  const { data: existingSession, isLoading: sessionLoading } = trpc.auth.me.useQuery();
+  // A magic-link token must never silently replace an existing session
+  // (login CSRF / session fixation) — ask for an explicit click first.
+  const [needsConfirm, setNeedsConfirm] = useState(false);
+  const calledRef = useRef(false);
+
+  const verifyMutation = trpc.auth.verifyMagicLink.useMutation({
+    onSuccess: async (data) => {
+      // Desktop uses Bearer auth — persist the session token into the OS
+      // keychain so it survives across app restarts. No-op on web.
+      if (isDesktop() && data?.sessionToken) {
+        await saveDesktopToken(data.sessionToken);
+      }
+      if (existingSession?.user) utils.invalidate();
+      else utils.auth.me.invalidate();
+      const pendingToken = sessionStorage.getItem("pendingInviteToken");
+      if (data.needsProfile) {
+        navigate({
+          to: "/auth/complete-profile",
+          search: pendingToken ? { invite: "1" } : undefined,
+        });
+      } else if (pendingToken) {
+        navigate({ to: `/invite/${pendingToken}` });
+      } else if (peekNativeRequest()) {
+        navigate({ to: "/auth/native" });
+      } else {
+        navigate({ to: "/" });
+      }
+    },
+    onError: (e) => setError(e.message),
+  });
+
+  useEffect(() => {
+    // Strip the token from the URL immediately to prevent Referer
+    // leakage and to stop a browser reload from re-triggering a spent token.
+    window.history.replaceState({}, "", "/auth/verify");
+  }, []);
+
+  useEffect(() => {
+    if (sessionLoading || calledRef.current) return;
+    calledRef.current = true;
+
+    if (!token) {
+      setError("No token found in URL.");
+      return;
+    }
+
+    if (existingSession?.user) {
+      setNeedsConfirm(true);
+      return;
+    }
+
+    verifyMutation.mutate({ token });
+  }, [sessionLoading]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  function confirmSwitch() {
+    if (!token) return;
+    setNeedsConfirm(false);
+    verifyMutation.mutate({ token });
+  }
+
+  return (
+    <div className="min-h-screen flex items-center justify-center px-4 bg-surface-1">
+      <div className="w-full max-w-[380px] rounded-2xl p-8 shadow-elevated bg-surface-0 border border-border-light text-center">
+        <div className="flex items-center justify-center gap-2.5 mb-8">
+          <Logo className="w-9 h-9" />
+          <span className="font-semibold text-lg tracking-tight text-text-primary">
+            Hisaabo
+          </span>
+        </div>
+
+        {error ? (
+          <>
+            <div className="w-12 h-12 mx-auto mb-4 rounded-full bg-red-100 dark:bg-red-950 flex items-center justify-center">
+              <svg className="w-6 h-6 text-red-600 dark:text-red-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+              </svg>
+            </div>
+            <h1 className="text-lg font-semibold text-text-primary mb-2">
+              Link expired or invalid
+            </h1>
+            <p className="text-sm text-text-tertiary mb-6">{error}</p>
+            <button
+              onClick={() => navigate({ to: "/login" })}
+              className="btn-primary w-full py-2.5"
+            >
+              Back to sign in
+            </button>
+          </>
+        ) : needsConfirm ? (
+          <>
+            <h1 className="text-lg font-semibold text-text-primary mb-2">
+              You are already signed in
+            </h1>
+            <p className="text-sm text-text-tertiary mb-6">
+              Signing in with this link will replace your current session. Switch account?
+            </p>
+            <button onClick={confirmSwitch} className="btn-primary w-full py-2.5 mb-3">
+              Switch account
+            </button>
+            <button
+              onClick={() => navigate({ to: "/" })}
+              className="text-sm text-text-tertiary hover:text-text-primary underline underline-offset-2"
+            >
+              Stay signed in
+            </button>
+          </>
+        ) : (
+          <>
+            <div className="w-12 h-12 mx-auto mb-4 rounded-full bg-brand-100 dark:bg-brand-600/20 flex items-center justify-center">
+              <svg className="w-6 h-6 text-brand-600 animate-spin" fill="none" viewBox="0 0 24 24">
+                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+              </svg>
+            </div>
+            <h1 className="text-lg font-semibold text-text-primary mb-1">
+              Verifying your link...
+            </h1>
+            <p className="text-sm text-text-tertiary">
+              Just a moment
+            </p>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}

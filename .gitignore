@@ -1,0 +1,62 @@
+node_modules/
+dist/
+.turbo/
+.env
+.env.local
+.env.prod
+*.log
+
+# Database (keep migration files — they're deployment artifacts)
+# packages/db/drizzle/ — NOT ignored, migrations must be committed
+
+# Tauri
+apps/desktop/src-tauri/target/
+
+# Mobile
+apps/mobile/android/
+apps/mobile/ios/
+apps/mobile/build/
+*.apk
+*.aab
+*.ipa
+
+# Test coverage
+coverage/
+
+# Playwright
+e2e/.auth/
+e2e/test-results/
+e2e/playwright-report/
+
+# Build artifacts
+*.tsbuildinfo
+.astro/
+.expo/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Internal docs (not open source)
+.claude
+CLAUDE.md
+SAAS.md
+SECURITY_PENDING.md
+docs/WEBSITE_PRD.md
+screens/
+
+*.csv
+
+# Backups
+backups/
+
+feature-parity.yaml
+test-results
+
+# Debug dumps
+*-dump.json

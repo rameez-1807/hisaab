@@ -1,0 +1,46 @@
+import { Command } from "commander";
+import {
+  journalListCommand,
+  journalGetCommand,
+  journalVoidCommand,
+  journalTemplatesCommand,
+} from "../../commands/journal/index.js";
+
+export function registerJournalCommands(program: Command): void {
+  const journal = program.command("journal").description("Journal entries and templates");
+
+  journal
+    .command("list")
+    .description("List journal entries")
+    .option("--json", "JSON output")
+    .option("--from <date>", "From date")
+    .option("--to <date>", "To date")
+    .action(async (opts) => {
+      await journalListCommand({ json: opts.json, from: opts.from, to: opts.to });
+    });
+
+  journal
+    .command("get <id>")
+    .description("Get journal entry details")
+    .option("--json", "JSON output")
+    .action(async (id: string, opts) => {
+      await journalGetCommand(id, { json: opts.json });
+    });
+
+  journal
+    .command("void <id>")
+    .description("Void a journal entry")
+    .option("--yes", "Skip confirmation prompt")
+    .option("--json", "JSON output")
+    .action(async (id: string, opts) => {
+      await journalVoidCommand(id, { json: opts.json, yes: opts.yes });
+    });
+
+  journal
+    .command("templates")
+    .description("List journal entry templates")
+    .option("--json", "JSON output")
+    .action(async (opts) => {
+      await journalTemplatesCommand({ json: opts.json });
+    });
+}

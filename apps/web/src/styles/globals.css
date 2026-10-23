@@ -1,0 +1,300 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --surface-0: #ffffff;
+  --surface-1: #f8f9fa;
+  --surface-2: #f1f3f5;
+  --surface-3: #e9ecef;
+  --text-primary: #1a1a2e;
+  --text-secondary: #495057;
+  --text-tertiary: #868e96;
+  --border-color: #dee2e6;
+  --border-light: #e9ecef;
+  --brand-600: #5b5bd6;
+  --success: #2b8a3e;
+  --warning: #d97706;
+  --danger: #dc2626;
+  --info: #2563eb;
+}
+
+.dark {
+  --surface-0: #141417;
+  --surface-1: #1a1a1f;
+  --surface-2: #232329;
+  --surface-3: #2c2c35;
+  --text-primary: #e4e4e8;
+  --text-secondary: #a1a1aa;
+  --text-tertiary: #71717a;
+  --border-color: #2c2c35;
+  --border-light: #232329;
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html {
+  font-family: "DM Sans", system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  background: var(--surface-0);
+  color: var(--text-primary);
+}
+
+body {
+  min-height: 100vh;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border-color); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: var(--text-tertiary); }
+
+/* Focus ring */
+*:focus-visible {
+  outline: 2px solid var(--brand-600);
+  outline-offset: 2px;
+}
+
+/* Smooth transitions */
+button, a, input, select, textarea {
+  transition: all 0.15s ease;
+}
+
+/* Input base */
+input, select, textarea {
+  font-family: inherit;
+  font-size: 0.875rem;
+}
+
+@layer components {
+  /* Buttons */
+  .btn-primary {
+    @apply inline-flex items-center justify-center gap-2 px-4 py-2 rounded-lg bg-brand-600 text-white text-sm font-medium transition-all duration-150 hover:bg-brand-700 active:bg-brand-800 disabled:opacity-50 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-500 focus-visible:ring-offset-2;
+  }
+  .btn-secondary {
+    @apply inline-flex items-center justify-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-all duration-150 border disabled:opacity-50 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-500 focus-visible:ring-offset-2;
+    background: var(--surface-0);
+    color: var(--text-secondary);
+    border-color: var(--border-color);
+  }
+  .btn-secondary:hover {
+    background: var(--surface-1);
+    color: var(--text-primary);
+  }
+  .btn-ghost {
+    @apply inline-flex items-center justify-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-all duration-150 disabled:opacity-50 focus-visible:outline-none;
+    color: var(--text-secondary);
+  }
+  .btn-ghost:hover {
+    background: var(--surface-2);
+    color: var(--text-primary);
+  }
+  .btn-danger {
+    @apply inline-flex items-center justify-center gap-2 px-4 py-2 rounded-lg bg-red-600 text-white text-sm font-medium transition-all duration-150 hover:bg-red-700 active:bg-red-800 disabled:opacity-50 disabled:cursor-not-allowed focus-visible:outline-none;
+  }
+  .btn-icon {
+    @apply inline-flex items-center justify-center p-2 rounded-lg transition-colors duration-150;
+    color: var(--text-tertiary);
+  }
+  .btn-icon:hover {
+    background: var(--surface-2);
+    color: var(--text-primary);
+  }
+
+  /* Form elements */
+  .input {
+    @apply w-full px-3 py-2 rounded-lg text-sm outline-none transition-colors duration-150;
+    background: var(--surface-0);
+    border: 1px solid var(--border-color);
+    color: var(--text-primary);
+  }
+  .input::placeholder {
+    color: var(--text-tertiary);
+  }
+  .input:hover {
+    border-color: var(--border-color);
+  }
+  .input:focus {
+    border-color: var(--brand-600);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--brand-600) 10%, transparent);
+  }
+  .input:disabled {
+    @apply opacity-50 cursor-not-allowed;
+  }
+
+  /* Suppress native number-input spinner buttons everywhere — they push the
+     value text against the right edge of the field and look inconsistent
+     across browsers. We rely on type="number" for keyboard/IME behaviour and
+     server-side validation, not the spinner UI. */
+  .input[type="number"] {
+    -moz-appearance: textfield;
+    appearance: textfield;
+  }
+  .input[type="number"]::-webkit-outer-spin-button,
+  .input[type="number"]::-webkit-inner-spin-button {
+    -webkit-appearance: none;
+    margin: 0;
+  }
+
+  .label {
+    @apply block text-xs font-medium mb-1.5;
+    color: var(--text-secondary);
+  }
+
+  /* Cards */
+  .card {
+    @apply rounded-xl;
+    background: var(--surface-0);
+    border: 1px solid var(--border-light);
+  }
+  /* Subtle lift on hover — opt-in via .card-interactive */
+  .card-interactive {
+    @apply rounded-xl transition-all duration-200;
+    background: var(--surface-0);
+    border: 1px solid var(--border-light);
+  }
+  .card-interactive:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 4px 12px -2px rgb(0 0 0 / 0.08), 0 2px 6px -2px rgb(0 0 0 / 0.05);
+    border-color: var(--border-color);
+  }
+
+  /* Data tables */
+  .data-table {
+    @apply w-full text-sm;
+  }
+  .data-table th {
+    @apply px-4 py-2.5 text-xs font-medium text-left;
+    color: var(--text-tertiary);
+    background: var(--surface-1);
+    border-bottom: 1px solid var(--border-light);
+  }
+  .data-table th.text-right {
+    text-align: right;
+  }
+  .data-table td {
+    @apply px-4 py-3;
+    color: var(--text-primary);
+    border-bottom: 1px solid var(--border-light);
+  }
+  .data-table tbody tr {
+    @apply transition-colors duration-100;
+  }
+  .data-table tbody tr:hover {
+    background: var(--surface-1);
+  }
+  .data-table tbody tr:last-child td {
+    border-bottom: none;
+  }
+
+  /* Skeleton */
+  .skeleton {
+    @apply animate-pulse rounded;
+    background: var(--surface-2);
+  }
+}
+
+/* ── Micro-animation keyframes ──────────────────────────────────────────── */
+
+/* Milestone banner: gentle fade + slide from top */
+@keyframes milestone-enter {
+  from {
+    opacity: 0;
+    transform: translateY(-6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* Success checkmark draw-on effect in the toast icon */
+@keyframes check-draw {
+  from {
+    stroke-dashoffset: 20;
+    opacity: 0;
+  }
+  to {
+    stroke-dashoffset: 0;
+    opacity: 1;
+  }
+}
+
+/* ── Target progress bar animations ────────────────────────────────────────── */
+
+/* Smooth fill on mount */
+@keyframes target-fill {
+  from { width: 0%; }
+}
+
+/* Gentle pulse when near completion (>90%) — draws attention without distraction */
+@keyframes target-pulse {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.8; }
+}
+
+/* Achievement banner: same entry as milestone */
+@keyframes target-achieve-enter {
+  from {
+    opacity: 0;
+    transform: translateY(-8px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+/* Soft glow on 100%+ bars */
+@keyframes target-glow {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0); }
+  50%       { box-shadow: 0 0 6px 2px rgba(16, 185, 129, 0.25); }
+}
+
+.target-progress-fill {
+  transition: width 1s cubic-bezier(0.4, 0, 0.2, 1);
+  animation: target-fill 1s cubic-bezier(0.4, 0, 0.2, 1) both;
+}
+
+.target-progress-fill--near {
+  animation:
+    target-fill 1s cubic-bezier(0.4, 0, 0.2, 1) both,
+    target-pulse 2s ease-in-out 1s infinite;
+}
+
+.target-progress-fill--achieved {
+  animation:
+    target-fill 0.8s cubic-bezier(0.4, 0, 0.2, 1) both,
+    target-glow 2.5s ease-in-out 0.8s infinite;
+}
+
+.target-achieve-banner {
+  animation: target-achieve-enter 0.4s cubic-bezier(0.34, 1.56, 0.64, 1) both;
+}
+
+/* Reduced-motion: disable all decorative animations */
+@media (prefers-reduced-motion: reduce) {
+  .card-interactive {
+    transition: none;
+  }
+  .card-interactive:hover {
+    transform: none;
+  }
+  [class*="animate-milestone"],
+  [class*="animate-check"] {
+    animation: none;
+  }
+  .target-progress-fill,
+  .target-progress-fill--near,
+  .target-progress-fill--achieved,
+  .target-achieve-banner {
+    animation: none;
+    transition: none;
+  }
+}

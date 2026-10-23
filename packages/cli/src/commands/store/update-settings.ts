@@ -1,0 +1,60 @@
+import { HisaaboClient, HisaaboApiError } from "../../client.js";
+import { requireAuth } from "../../config.js";
+import { outputJSON, EXIT, fatalError, success } from "../../output.js";
+import type { InputOf } from "../../api-types.js";
+
+export async function storeUpdateSettingsCommand(opts: {
+  slug?: string;
+  tagline?: string;
+  enabled?: string;
+  requirePhoneOtp?: string;
+  json?: boolean;
+}): Promise<void> {
+  const cfg = requireAuth();
+  const client = new HisaaboClient(cfg);
+
+  const data: InputOf<"store.updateSettings"> = {};
+  if (opts.slug !== undefined) data.storeSlug = opts.slug;
+  if (opts.tagline !== undefined) data.storeTagline = opts.tagline;
+  if (opts.enabled !== undefined) {
+    if (opts.enabled !== "true" && opts.enabled !== "false") {
+      fatalError("--enabled must be 'true' or 'false'", EXIT.USAGE);
+    }
+    data.storeEnabled = opts.enabled === "true";
+  }
+  if (opts.requirePhoneOtp !== undefined) {
+    if (opts.requirePhoneOtp !== "true" && opts.requirePhoneOtp !== "false") {
+      fatalError("--require-phone-otp must be 'true' or 'false'", EXIT.USAGE);
+    }
+    data.storeRequirePhoneOtp = opts.requirePhoneOtp === "true";
+  }
+
+  if (Object.keys(data).length === 0) {
+    fatalError("At least one option is required (--slug, --tagline, --enabled, --require-phone-otp)", EXIT.USAGE);
+  }
+
+  try {
+    const result = await client.store.updateSettings(data);
+
+    if (opts.json) {
+      outputJSON(result);
+      return;
+    }
+
+    success("Store settings updated");
+    console.log(`  Enabled:  ${result.storeEnabled ? "Yes" : "No"}`);
+    console.log(`  SMS OTP:  ${result.storeRequirePhoneOtp ? "Required" : "Off"}`);
+    if (result.storeSlug) console.log(`  Slug:     ${result.storeSlug}`);
+    if (result.storeTagline) console.log(`  Tagline:  ${result.storeTagline}`);
+    console.log();
+
+  } catch (e) {
+    if (e instanceof HisaaboApiError) {
+      const err = e.hisaaboError;
+      if (err.code === "unauthorized") fatalError("Session expired. Run: hisaabo login", EXIT.AUTH);
+      if (err.code === "validation_failed") fatalError(e.message, EXIT.VALIDATION);
+      if (err.code === "network_error") fatalError(err.message, EXIT.NETWORK);
+    }
+    fatalError(String(e instanceof Error ? e.message : e));
+  }
+}

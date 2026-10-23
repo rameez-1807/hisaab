@@ -1,0 +1,41 @@
+{
+  "name": "@hisaabo/db",
+  "version": "0.9.0",
+  "private": true,
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./package.json": "./package.json",
+    "./*": "./*"
+  },
+  "scripts": {
+    "migrate": "tsx src/migrate-cli.ts",
+    "db:reconcile-store-slugs": "tsx src/migrate-cli.ts --reconcile-store-slugs",
+    "db:generate": "drizzle-kit generate && drizzle-kit generate --config drizzle-control.config.ts && drizzle-kit generate --config drizzle-tenant.config.ts",
+    "db:generate:unified": "drizzle-kit generate",
+    "db:generate:all": "drizzle-kit generate && drizzle-kit generate --config drizzle-control.config.ts && drizzle-kit generate --config drizzle-tenant.config.ts",
+    "db:migrate": "tsx src/migrate-cli.ts",
+    "db:push": "drizzle-kit push",
+    "db:push:control": "drizzle-kit push --config drizzle-control.config.ts",
+    "db:push:tenant": "drizzle-kit push --config drizzle-tenant.config.ts",
+    "db:push:all": "pnpm db:push:control && pnpm db:push:tenant",
+    "db:generate:control": "drizzle-kit generate --config drizzle-control.config.ts",
+    "db:generate:tenant": "drizzle-kit generate --config drizzle-tenant.config.ts",
+    "db:reset": "pnpm exec tsx src/reset.ts && pnpm db:push",
+    "studio": "drizzle-kit studio",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "dotenv": "^18.0.5",
+    "drizzle-orm": "^0.45.3",
+    "postgres": "^3.4.9"
+  },
+  "devDependencies": {
+    "drizzle-kit": "^0.31.11",
+    "esbuild": "^0.28.2",
+    "tsx": "^4.23.15",
+    "typescript": "^5.9.3"
+  }
+}

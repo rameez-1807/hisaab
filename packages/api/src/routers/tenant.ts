@@ -1,0 +1,697 @@
+import { z } from "zod";
+import { TRPCError } from "@trpc/server";
+import { controlDb, tenants, tenantMembers, invitations, users, sessions, apiKeys, provisionTenantDatabase, cleanupTenantDatabase } from "@hisaabo/db";
+import { eq, and, gt, isNull, desc } from "drizzle-orm";
+import { nanoid } from "nanoid";
+import { createHash } from "node:crypto";
+import { router, publicProcedure, protectedProcedure, tenantProcedure } from "../trpc.js";
+import { getSessionIdFromRequest } from "../context.js";
+import { cacheBus } from "../lib/cache/bus.js";
+import { requireTenantRole, ADMIN_ROLES } from "../lib/tenant-access.js";
+import { normalizeEmail, emailEq } from "../lib/normalize-email.js";
+import { emailService } from "../lib/email.js";
+import { lockSignup, isOpenSignupEnabled, hasPendingInvitation, SIGNUP_CLOSED_MESSAGE } from "../lib/signup-policy.js";
+import { enforceTeamMemberLimit, enforceOrgCreationLimit, getLimits } from "../lib/plan-limits.js";
+
+function hashInvitationToken(token: string): string {
+  return createHash("sha256").update(token).digest("hex");
+}
+
+async function autoSelectTenantInSession(req: Request, tenantId: string): Promise<string> {
+  const sessionId = getSessionIdFromRequest(req);
+  if (sessionId) {
+    await cacheBus.afterWrite([{ kind: "session", sessionId }], () =>
+      controlDb.update(sessions)
+        .set({ tenantId })
+        .where(eq(sessions.id, sessionId)),
+    );
+  }
+  const [tenant] = await controlDb.select({ name: tenants.name })
+    .from(tenants)
+    .where(eq(tenants.id, tenantId))
+    .limit(1);
+  return tenant?.name ?? "Organization";
+}
+
+async function assertEmailVerified(userId: string): Promise<void> {
+  const [row] = await controlDb.select({ emailVerified: users.emailVerified })
+    .from(users).where(eq(users.id, userId)).limit(1);
+  if (!row?.emailVerified) {
+    throw new TRPCError({
+      code: "FORBIDDEN",
+      message: "Verify your email address (sign in with an email link) before accepting an invitation",
+    });
+  }
+}
+
+type InvitationRow = typeof invitations.$inferSelect;
+
+// Claims the invitation (acceptedAt IS NULL guard) and creates the membership
+// in one transaction so a single invitation can only ever grant access once.
+async function claimInvitationAndAddMember(invitation: InvitationRow, userId: string): Promise<void> {
+  // `membership` is emitted after the transaction settled (a new member can
+  // change the authz result of anything cached for the tenant).
+  await cacheBus.afterWrite([{ kind: "membership", tenantId: invitation.tenantId, userId }], () =>
+    controlDb.transaction(async (tx) => {
+    const claimed = await tx.update(invitations)
+      .set({ acceptedAt: new Date() })
+      .where(and(eq(invitations.id, invitation.id), isNull(invitations.acceptedAt)))
+      .returning({ id: invitations.id });
+    if (claimed.length === 0) {
+      throw new TRPCError({ code: "NOT_FOUND", message: "Invalid or expired invitation" });
+    }
+    await tx.insert(tenantMembers).values({
+      tenantId: invitation.tenantId,
+      userId,
+      role: invitation.role,
+      invitedBy: invitation.invitedBy ?? undefined,
+      acceptedAt: new Date(),
+    });
+  }));
+}
+
+// Everything a removed member could still use against the tenant.
+async function revokeMemberAccess(tenantId: string, userId: string, email: string | null): Promise<void> {
+  // Events are emitted in `finally`, after the writes settled (even if one of
+  // them throws half-way): API keys, every session that pointed at this
+  // tenant, and the membership/authz entries of the tenant.
+  try {
+    await controlDb.delete(apiKeys).where(and(eq(apiKeys.tenantId, tenantId), eq(apiKeys.userId, userId)));
+    if (email) {
+      await controlDb.delete(invitations).where(and(eq(invitations.tenantId, tenantId), emailEq(invitations.email, email)));
+    }
+    const affectedSessions = await controlDb.select({ id: sessions.id })
+      .from(sessions)
+      .where(and(eq(sessions.userId, userId), eq(sessions.tenantId, tenantId)));
+    if (affectedSessions.length > 0) {
+      await controlDb.update(sessions)
+        .set({ tenantId: null })
+        .where(and(eq(sessions.userId, userId), eq(sessions.tenantId, tenantId)));
+    }
+  } finally {
+    cacheBus.invalidate([
+      { kind: "apiKey", userId, tenantId },
+      // By user: covers every session that pointed at this tenant (even ones
+      // created between the SELECT and the UPDATE above).
+      { kind: "session", userId },
+      { kind: "membership", tenantId, userId },
+    ]);
+  }
+}
+
+function generateSlug(name: string): string {
+  return name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 48) + "-" + nanoid(6);
+}
+
+export const tenantRouter = router({
+  // Create a new organization for the authenticated user.
+  // User becomes the owner. In self-hosted mode, joins the default tenant instead.
+  create: protectedProcedure.mutation(async ({ ctx }) => {
+    await enforceOrgCreationLimit(ctx.user.id);
+    const displayName = ctx.user.name ?? ctx.user.email.split("@")[0];
+
+    if (process.env.MULTI_TENANT === "true") {
+      const tenantName = `${displayName}'s Organization`;
+      const slug = generateSlug(tenantName);
+
+      // Phase 1 (outside any tx): provision the physical DB + role + schema.
+      // CREATE DATABASE is non-transactional, so it MUST happen outside the
+      // control-DB transaction. If it throws, provisionTenantDatabase's own
+      // internal catch already cleaned up.
+      const dbConfig = await provisionTenantDatabase(nanoid(), slug);
+
+      // Phase 2 (inside tx): insert tenants row + owner membership atomically.
+      // If this tx fails (constraint violation, connection drop, COMMIT
+      // failure), we compensate by dropping the physical DB + role — without
+      // this, CREATE DATABASE would orphan resources forever.
+      let tenantId: string;
+      let createdTenantId: string | undefined;
+      try {
+        tenantId = await controlDb.transaction(async (tx) => {
+          const [tenant] = await tx.insert(tenants).values({
+            name: tenantName,
+            slug,
+            dbName: dbConfig.dbName,
+            dbHost: dbConfig.dbHost,
+            dbPort: dbConfig.dbPort,
+            dbUser: dbConfig.dbUser,
+            dbPassword: dbConfig.dbPassword,
+          }).returning({ id: tenants.id });
+
+          await tx.insert(tenantMembers).values({
+            tenantId: tenant.id,
+            userId: ctx.user.id,
+            role: "owner",
+            acceptedAt: new Date(),
+          });
+
+          createdTenantId = tenant.id;
+          return tenant.id;
+        });
+      } catch (err) {
+        // Drop the orphan physical DB + role since the control-DB writes
+        // rolled back. Best-effort — never throws.
+        await cleanupTenantDatabase(dbConfig.dbName, dbConfig.dbUser);
+        throw err;
+      } finally {
+        // After the transaction settled (commit or rollback).
+        if (createdTenantId) {
+          cacheBus.invalidate({ kind: "membership", tenantId: createdTenantId, userId: ctx.user.id });
+        }
+      }
+
+      // Auto-select the new tenant in session (outside tx, not part of the
+      // orphan-compensation contract — failure here only affects UX, not
+      // cluster state)
+      const tenantNameResult = await autoSelectTenantInSession(ctx.req, tenantId);
+      return { tenantId, tenantName: tenantNameResult };
+    } else {
+      // Self-hosted: join/create default tenant. Once the default tenant has
+      // an owner this needs a pending invitation unless open signup is on.
+      let touchedTenantId: string | undefined;
+      const defaultTenantId = await controlDb.transaction(async (tx) => {
+        await lockSignup(tx);
+
+        let [defaultTenant] = await tx.select({ id: tenants.id })
+          .from(tenants).where(eq(tenants.slug, "default")).limit(1);
+        if (!defaultTenant) {
+          [defaultTenant] = await tx.insert(tenants).values({
+            name: "Default Organization", slug: "default",
+          }).returning({ id: tenants.id });
+        }
+
+        const memberCount = await tx.select({ id: tenantMembers.id })
+          .from(tenantMembers).where(eq(tenantMembers.tenantId, defaultTenant.id));
+
+        if (memberCount.length > 0 && !isOpenSignupEnabled() && !(await hasPendingInvitation(tx, normalizeEmail(ctx.user.email)))) {
+          throw new TRPCError({ code: "FORBIDDEN", message: SIGNUP_CLOSED_MESSAGE });
+        }
+
+        touchedTenantId = defaultTenant.id;
+        await tx.insert(tenantMembers).values({
+          tenantId: defaultTenant.id, userId: ctx.user.id,
+          role: memberCount.length === 0 ? "owner" : "member", acceptedAt: new Date(),
+        });
+        return defaultTenant.id;
+      }).finally(() => {
+        // After the transaction settled (commit or rollback).
+        if (touchedTenantId) {
+          cacheBus.invalidate({ kind: "membership", tenantId: touchedTenantId, userId: ctx.user.id });
+        }
+      });
+
+      const tenantNameResult = await autoSelectTenantInSession(ctx.req, defaultTenantId);
+      return { tenantId: defaultTenantId, tenantName: tenantNameResult };
+    }
+  }),
+
+  // Check if the user can create a new org (plan limit not reached).
+  canCreateOrg: protectedProcedure.query(async ({ ctx }) => {
+    const ownedOrgs = await controlDb.select({ plan: tenants.plan })
+      .from(tenantMembers)
+      .innerJoin(tenants, eq(tenants.id, tenantMembers.tenantId))
+      .where(and(
+        eq(tenantMembers.userId, ctx.user.id),
+        eq(tenantMembers.role, "owner"),
+      ));
+
+    const planRank: Record<string, number> = { free: 0, pro: 1, business: 2, enterprise: 3 };
+    let bestPlan = "free";
+    for (const org of ownedOrgs) {
+      if ((planRank[org.plan ?? "free"] ?? 0) > (planRank[bestPlan] ?? 0)) {
+        bestPlan = org.plan ?? "free";
+      }
+    }
+
+    const limits = getLimits(bestPlan);
+    return limits.maxOwnedOrgs === Infinity || ownedOrgs.length < limits.maxOwnedOrgs;
+  }),
+
+  // List user's tenant memberships
+  list: protectedProcedure.query(async ({ ctx }) => {
+    const memberships = await controlDb.select({
+      tenantId: tenantMembers.tenantId,
+      role: tenantMembers.role,
+      tenantName: tenants.name,
+      tenantSlug: tenants.slug,
+      tenantPlan: tenants.plan,
+    })
+      .from(tenantMembers)
+      .innerJoin(tenants, eq(tenants.id, tenantMembers.tenantId))
+      .where(and(
+        eq(tenantMembers.userId, ctx.user.id),
+        eq(tenants.status, "active"),
+      ));
+    return memberships;
+  }),
+
+  // Pending invitations for the authenticated user's email.
+  // Used by the NoOrgScreen to show "You've been invited to [Org]".
+  myInvitations: protectedProcedure.query(async ({ ctx }) => {
+    const pending = await controlDb.select({
+      id: invitations.id,
+      tenantName: tenants.name,
+      role: invitations.role,
+    })
+      .from(invitations)
+      .innerJoin(tenants, eq(tenants.id, invitations.tenantId))
+      .where(and(
+        emailEq(invitations.email, ctx.user.email),
+        isNull(invitations.acceptedAt),
+        gt(invitations.expiresAt, new Date()),
+      ));
+    return pending;
+  }),
+
+  // Accept invitation by ID (for users who see their pending invites in-app,
+  // without having clicked the email link). Same logic as acceptInvitation
+  // but looks up by ID + email match instead of raw token.
+  acceptById: protectedProcedure
+    .input(z.object({ invitationId: z.string().uuid() }))
+    .mutation(async ({ input, ctx }) => {
+      const [invitation] = await controlDb.select()
+        .from(invitations)
+        .where(and(
+          eq(invitations.id, input.invitationId),
+          emailEq(invitations.email, ctx.user.email),
+          isNull(invitations.acceptedAt),
+          gt(invitations.expiresAt, new Date()),
+        ))
+        .limit(1);
+
+      if (!invitation) {
+        throw new TRPCError({ code: "NOT_FOUND", message: "Invitation not found or expired" });
+      }
+      await assertEmailVerified(ctx.user.id);
+
+      // Check if already a member
+      const [existingMember] = await controlDb.select({ id: tenantMembers.id })
+        .from(tenantMembers)
+        .where(and(
+          eq(tenantMembers.tenantId, invitation.tenantId),
+          eq(tenantMembers.userId, ctx.user.id),
+        ))
+        .limit(1);
+
+      if (existingMember) {
+        await controlDb.update(invitations).set({ acceptedAt: new Date() }).where(eq(invitations.id, invitation.id));
+        const tenantName = await autoSelectTenantInSession(ctx.req, invitation.tenantId);
+        return { tenantId: invitation.tenantId, tenantName };
+      }
+
+      await claimInvitationAndAddMember(invitation, ctx.user.id);
+
+      const tenantName = await autoSelectTenantInSession(ctx.req, invitation.tenantId);
+      return { tenantId: invitation.tenantId, tenantName };
+    }),
+
+  // Select/switch tenant — updates session's tenantId
+  select: protectedProcedure
+    .input(z.object({ tenantId: z.string().uuid() }))
+    .mutation(async ({ input, ctx }) => {
+      // Verify user is a member of this tenant
+      const [membership] = await controlDb.select({ id: tenantMembers.id })
+        .from(tenantMembers)
+        .where(and(
+          eq(tenantMembers.tenantId, input.tenantId),
+          eq(tenantMembers.userId, ctx.user.id),
+        ))
+        .limit(1);
+
+      if (!membership) {
+        throw new TRPCError({ code: "FORBIDDEN", message: "Not a member of this organization" });
+      }
+
+      // Get session ID from cookie or Bearer token (mobile uses Bearer)
+      const sessionId = getSessionIdFromRequest(ctx.req);
+      if (!sessionId) throw new TRPCError({ code: "UNAUTHORIZED" });
+
+      // Update session's tenantId; the cached session is dropped once the
+      // write settled so the next request picks up the new tenant.
+      await cacheBus.afterWrite([{ kind: "session", sessionId }], () =>
+        controlDb.update(sessions)
+          .set({ tenantId: input.tenantId })
+          .where(eq(sessions.id, sessionId)),
+      );
+
+      return { success: true };
+    }),
+
+  // Get current tenant info
+  current: tenantProcedure.query(async ({ ctx }) => {
+    const [tenant] = await controlDb.select({
+      id: tenants.id,
+      name: tenants.name,
+      slug: tenants.slug,
+      plan: tenants.plan,
+      status: tenants.status,
+      createdAt: tenants.createdAt,
+    })
+      .from(tenants)
+      .where(eq(tenants.id, ctx.tenantId))
+      .limit(1);
+    return tenant ?? null;
+  }),
+
+  // List members of current tenant
+  members: tenantProcedure.query(async ({ ctx }) => {
+    // seller_manager needs the roster to assign sales targets, but not emails.
+    const role = await requireTenantRole(ctx, [...ADMIN_ROLES, "seller_manager"], "Only owners and admins can view members");
+    const members = await controlDb.select({
+      id: tenantMembers.id,
+      userId: tenantMembers.userId,
+      role: tenantMembers.role,
+      acceptedAt: tenantMembers.acceptedAt,
+      createdAt: tenantMembers.createdAt,
+      userName: users.name,
+      userEmail: users.email,
+    })
+      .from(tenantMembers)
+      .innerJoin(users, eq(users.id, tenantMembers.userId))
+      .where(eq(tenantMembers.tenantId, ctx.tenantId));
+    if (!(ADMIN_ROLES as readonly string[]).includes(role)) {
+      return members.map((m) => ({ ...m, userEmail: "" }));
+    }
+    return members;
+  }),
+
+  // Invite a member
+  inviteMember: tenantProcedure
+    .input(z.object({
+      email: z.string().email(),
+      role: z.enum(["admin", "seller_manager", "seller", "accountant"]).default("seller"),
+      returnLink: z.boolean().optional(),
+    }))
+    .mutation(async ({ input, ctx }) => {
+      await requireTenantRole(ctx, ADMIN_ROLES, "Only owners and admins can invite members");
+
+      const inviteEmail = normalizeEmail(input.email);
+
+      // Enforce team member limit before proceeding
+      await enforceTeamMemberLimit(ctx.tenantId);
+
+      // Check if already a member
+      const [existingUser] = await controlDb.select({ id: users.id })
+        .from(users).where(emailEq(users.email, inviteEmail)).limit(1);
+
+      if (existingUser) {
+        const [existingMember] = await controlDb.select({ id: tenantMembers.id })
+          .from(tenantMembers)
+          .where(and(
+            eq(tenantMembers.tenantId, ctx.tenantId),
+            eq(tenantMembers.userId, existingUser.id),
+          ))
+          .limit(1);
+
+        if (existingMember) {
+          throw new TRPCError({ code: "CONFLICT", message: "User is already a member" });
+        }
+      }
+
+      // Check for existing pending invitation (prevent duplicates)
+      const [existingInvite] = await controlDb.select({ id: invitations.id })
+        .from(invitations)
+        .where(and(
+          eq(invitations.tenantId, ctx.tenantId),
+          emailEq(invitations.email, inviteEmail),
+          isNull(invitations.acceptedAt),
+          gt(invitations.expiresAt, new Date()),
+        ))
+        .limit(1);
+
+      if (existingInvite) {
+        throw new TRPCError({ code: "CONFLICT", message: "A pending invitation for this email already exists" });
+      }
+
+      const rawToken = nanoid(32);
+      const tokenHash = hashInvitationToken(rawToken);
+      const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000); // 7 days
+
+      await controlDb.insert(invitations).values({
+        tenantId: ctx.tenantId,
+        email: inviteEmail,
+        role: input.role,
+        token: tokenHash, // Store hash, never the raw token
+        invitedBy: ctx.user.id,
+        expiresAt,
+      });
+
+      // Fire-and-forget invitation email — failure doesn't block invite creation
+      const [tenant] = await controlDb.select({ name: tenants.name })
+        .from(tenants)
+        .where(eq(tenants.id, ctx.tenantId))
+        .limit(1);
+
+      const [inviter] = await controlDb.select({ name: users.name })
+        .from(users)
+        .where(eq(users.id, ctx.user.id))
+        .limit(1);
+
+      const baseUrl = process.env.APP_URL || `http://localhost:${process.env.PORT || 5173}`;
+      const inviteUrl = `${baseUrl}/invite/${rawToken}`;
+
+      emailService.sendInvitation(
+        inviteEmail,
+        inviteUrl,
+        tenant?.name ?? "Organization",
+        inviter?.name ?? null,
+      ).catch((err) => {
+        console.error("[invite] Failed to send invitation email:", err);
+      });
+
+      // The link is only returned on request (web Team tab shows a copyable
+      // link); it is never logged.
+      return { expiresAt, inviteUrl: input.returnLink ? inviteUrl : undefined };
+    }),
+
+  // Accept an invitation
+  // Preview invitation details without accepting — used by the onboarding
+  // flow to show "Join [Org] or create your own?" before committing.
+  // Public because new users calling this may not have a session yet.
+  // Security: token is nanoid(32) (~192 bits entropy) — brute-force infeasible.
+  // Response deliberately omits email to avoid leaking PII via token possession.
+  peekInvitation: publicProcedure
+    .input(z.object({ token: z.string().min(1).max(128) }))
+    .query(async ({ input }) => {
+      const tokenHash = hashInvitationToken(input.token);
+      const [invitation] = await controlDb.select({
+        role: invitations.role,
+        tenantId: invitations.tenantId,
+        acceptedAt: invitations.acceptedAt,
+      })
+        .from(invitations)
+        .where(and(
+          eq(invitations.token, tokenHash),
+          gt(invitations.expiresAt, new Date()),
+        ))
+        .limit(1);
+
+      if (!invitation || invitation.acceptedAt) return null;
+
+      const [tenant] = await controlDb.select({ name: tenants.name })
+        .from(tenants)
+        .where(eq(tenants.id, invitation.tenantId))
+        .limit(1);
+
+      return {
+        tenantName: tenant?.name ?? "Organization",
+        role: invitation.role,
+      };
+    }),
+
+  acceptInvitation: protectedProcedure
+    .input(z.object({ token: z.string() }))
+    .mutation(async ({ input, ctx }) => {
+      const tokenHash = hashInvitationToken(input.token);
+      const [invitation] = await controlDb.select()
+        .from(invitations)
+        .where(and(
+          eq(invitations.token, tokenHash),
+          gt(invitations.expiresAt, new Date()),
+        ))
+        .limit(1);
+
+      if (!invitation) {
+        throw new TRPCError({ code: "NOT_FOUND", message: "Invalid or expired invitation" });
+      }
+
+      // Verify the invitation email matches the authenticated user
+      const [currentUser] = await controlDb.select({ email: users.email })
+        .from(users).where(eq(users.id, ctx.user.id)).limit(1);
+      if (!currentUser || normalizeEmail(currentUser.email) !== normalizeEmail(invitation.email)) {
+        throw new TRPCError({ code: "FORBIDDEN", message: "This invitation was sent to a different email address" });
+      }
+      await assertEmailVerified(ctx.user.id);
+
+      // If already accepted, treat as idempotent — the user may be clicking
+      // an old link or retrying after a partial failure. Check membership and
+      // auto-select the tenant if they're already in.
+      if (invitation.acceptedAt) {
+        const [existingMember] = await controlDb.select({ id: tenantMembers.id })
+          .from(tenantMembers)
+          .where(and(
+            eq(tenantMembers.tenantId, invitation.tenantId),
+            eq(tenantMembers.userId, ctx.user.id),
+          ))
+          .limit(1);
+        if (existingMember) {
+          const tenantName = await autoSelectTenantInSession(ctx.req, invitation.tenantId);
+          return { tenantId: invitation.tenantId, tenantName };
+        }
+        // Accepted but not a member (removed after accepting): an accepted
+        // invitation must never grant membership again.
+        throw new TRPCError({ code: "NOT_FOUND", message: "Invalid or expired invitation" });
+      }
+
+      // Check if already a member (e.g. double-click)
+      const [existingMember] = await controlDb.select({ id: tenantMembers.id })
+        .from(tenantMembers)
+        .where(and(
+          eq(tenantMembers.tenantId, invitation.tenantId),
+          eq(tenantMembers.userId, ctx.user.id),
+        ))
+        .limit(1);
+      if (existingMember) {
+        await controlDb.update(invitations).set({ acceptedAt: new Date() }).where(eq(invitations.id, invitation.id));
+        const tenantName = await autoSelectTenantInSession(ctx.req, invitation.tenantId);
+        return { tenantId: invitation.tenantId, tenantName };
+      }
+
+      // Create membership and mark invitation accepted atomically so a crash
+      // between the two writes cannot leave the user as a member with a
+      // re-usable invitation link.
+      await claimInvitationAndAddMember(invitation, ctx.user.id);
+
+      const tenantName = await autoSelectTenantInSession(ctx.req, invitation.tenantId);
+      return { tenantId: invitation.tenantId, tenantName };
+    }),
+
+  // List pending invitations for the current tenant
+  pendingInvitations: tenantProcedure.query(async ({ ctx }) => {
+    await requireTenantRole(ctx, ADMIN_ROLES, "Only owners and admins can view invitations");
+    const pending = await controlDb.select({
+      id: invitations.id,
+      email: invitations.email,
+      role: invitations.role,
+      createdAt: invitations.createdAt,
+      expiresAt: invitations.expiresAt,
+      invitedByName: users.name,
+    })
+      .from(invitations)
+      .leftJoin(users, eq(users.id, invitations.invitedBy))
+      .where(and(
+        eq(invitations.tenantId, ctx.tenantId),
+        isNull(invitations.acceptedAt),
+        gt(invitations.expiresAt, new Date()),
+      ))
+      .orderBy(desc(invitations.createdAt));
+
+    return pending;
+  }),
+
+  // Revoke a pending invitation
+  revokeInvitation: tenantProcedure
+    .input(z.object({ invitationId: z.string().uuid() }))
+    .mutation(async ({ input, ctx }) => {
+      await requireTenantRole(ctx, ADMIN_ROLES, "Only owners and admins can revoke invitations");
+
+      await controlDb.delete(invitations)
+        .where(and(
+          eq(invitations.id, input.invitationId),
+          eq(invitations.tenantId, ctx.tenantId),
+          isNull(invitations.acceptedAt),
+        ));
+
+      return { success: true };
+    }),
+
+  // Remove a member
+  removeMember: tenantProcedure
+    .input(z.object({ userId: z.string().uuid() }))
+    .mutation(async ({ input, ctx }) => {
+      await requireTenantRole(ctx, ADMIN_ROLES, "Only owners and admins can remove members");
+
+      if (input.userId === ctx.user.id) {
+        throw new TRPCError({ code: "BAD_REQUEST", message: "Cannot remove yourself" });
+      }
+
+      // Prevent removing a superadmin/owner
+      const [targetMembership] = await controlDb.select({ role: tenantMembers.role })
+        .from(tenantMembers)
+        .where(and(
+          eq(tenantMembers.tenantId, ctx.tenantId),
+          eq(tenantMembers.userId, input.userId),
+        ))
+        .limit(1);
+
+      if (targetMembership && ["owner", "superadmin"].includes(targetMembership.role)) {
+        throw new TRPCError({ code: "FORBIDDEN", message: "Cannot remove a superadmin" });
+      }
+
+      // Membership is invalidated FIRST (right after the delete settled): the
+      // removed user's very next call is denied even if the cleanup below is
+      // slow or fails half-way.
+      await cacheBus.afterWrite([{ kind: "membership", tenantId: ctx.tenantId, userId: input.userId }], () =>
+        controlDb.delete(tenantMembers)
+          .where(and(
+            eq(tenantMembers.tenantId, ctx.tenantId),
+            eq(tenantMembers.userId, input.userId),
+          )),
+      );
+
+      // Revoke the removed user's remaining access: API keys, invitations,
+      // session tenant selection (each invalidated after its writes settle).
+      const [removedUser] = await controlDb.select({ email: users.email })
+        .from(users).where(eq(users.id, input.userId)).limit(1);
+      await revokeMemberAccess(ctx.tenantId, input.userId, removedUser?.email ?? null);
+
+      return { success: true };
+    }),
+
+  // Update member role
+  updateMemberRole: tenantProcedure
+    .input(z.object({
+      userId: z.string().uuid(),
+      role: z.enum(["admin", "seller_manager", "seller", "accountant"]),
+    }))
+    .mutation(async ({ input, ctx }) => {
+      await requireTenantRole(ctx, ADMIN_ROLES, "Only owners and admins can change roles");
+
+      // Prevent changing a superadmin/owner's role
+      const [targetMembership] = await controlDb.select({ role: tenantMembers.role })
+        .from(tenantMembers)
+        .where(and(
+          eq(tenantMembers.tenantId, ctx.tenantId),
+          eq(tenantMembers.userId, input.userId),
+        ))
+        .limit(1);
+
+      if (targetMembership && ["owner", "superadmin"].includes(targetMembership.role)) {
+        throw new TRPCError({ code: "FORBIDDEN", message: "Cannot change the role of a superadmin" });
+      }
+
+      // Role change + key revocation, then (in `finally`, after BOTH writes
+      // settled) membership/authz AND API key caches are invalidated, so the
+      // member's very next call sees the new role and the old keys are dead.
+      await cacheBus.afterWrite(
+        [
+          { kind: "membership", tenantId: ctx.tenantId, userId: input.userId },
+          { kind: "apiKey", tenantId: ctx.tenantId, userId: input.userId },
+        ],
+        async () => {
+          await controlDb.update(tenantMembers)
+            .set({ role: input.role })
+            .where(and(
+              eq(tenantMembers.tenantId, ctx.tenantId),
+              eq(tenantMembers.userId, input.userId),
+            ));
+
+          // Keys minted under the previous role must not outlive it.
+          await controlDb.delete(apiKeys).where(and(eq(apiKeys.tenantId, ctx.tenantId), eq(apiKeys.userId, input.userId)));
+        },
+      );
+
+      return { success: true };
+    }),
+});
+

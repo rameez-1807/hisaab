@@ -1,0 +1,576 @@
+import { eq, and, sql, desc, inArray, isNull } from "drizzle-orm";
+import { z } from "zod";
+import { TRPCError } from "@trpc/server";
+import {
+  invoices,
+  invoiceItems,
+  items,
+  businesses,
+  parties,
+} from "@hisaabo/db";
+import {
+  createInvoiceSchema,
+  paginationSchema,
+  type DocumentType,
+  calcLineItem,
+  calcInvoiceTotals,
+  checkInvoiceDeleteAllowed,
+  checkDocumentStatusTransition,
+  canCreateDocumentType,
+  SELLER_PURCHASE_DENIED_MESSAGE,
+} from "@hisaabo/shared";
+import { router, viewerProcedure, memberProcedure, adminProcedure } from "../trpc.js";
+import { requireCan } from "./permissions.js";
+import { logAudit } from "./audit.js";
+import { assertNoPaymentsOrActiveIrn } from "./invoice-unlink-guard.js";
+import { buildBusinessDateFilter } from "./business-date.js";
+import { reverseDocumentStockEffect } from "./document-stock-reversal.js";
+import { applyStockDeltas } from "./stock-adjust.js";
+
+type InvoiceStatus = "draft" | "sent" | "paid" | "partial" | "overdue" | "cancelled";
+
+export interface DocumentRouterConfig {
+  documentType: string;
+  /** column name on businesses table for prefix, e.g. "quotationPrefix" */
+  prefixColumn: keyof typeof businesses.$inferSelect | null;
+  /** column name for next number counter, e.g. "nextQuotationNumber" */
+  counterColumn: keyof typeof businesses.$inferSelect | null;
+  allowedStatuses: string[];
+  /** whether creating this document type affects item stock */
+  stockEffect: "none" | "decrement" | "increment";
+}
+
+// Map document type to prefix/counter columns on businesses table
+const bizColumns = {
+  quotation: {
+    prefix: businesses.quotationPrefix,
+    counter: businesses.nextQuotationNumber,
+    setCounter: (n: number) => ({ nextQuotationNumber: n }),
+  },
+  credit_note: {
+    prefix: businesses.creditNotePrefix,
+    counter: businesses.nextCreditNoteNumber,
+    setCounter: (n: number) => ({ nextCreditNoteNumber: n }),
+  },
+  debit_note: {
+    prefix: businesses.debitNotePrefix,
+    counter: businesses.nextDebitNoteNumber,
+    setCounter: (n: number) => ({ nextDebitNoteNumber: n }),
+  },
+  delivery_challan: {
+    prefix: businesses.deliveryChallanPrefix,
+    counter: businesses.nextDeliveryChallanNumber,
+    setCounter: (n: number) => ({ nextDeliveryChallanNumber: n }),
+  },
+  proforma: {
+    prefix: businesses.proformaPrefix,
+    counter: businesses.nextProformaNumber,
+    setCounter: (n: number) => ({ nextProformaNumber: n }),
+  },
+  sales_return: {
+    prefix: businesses.salesReturnPrefix,
+    counter: businesses.nextSalesReturnNumber,
+    setCounter: (n: number) => ({ nextSalesReturnNumber: n }),
+  },
+  purchase_return: {
+    prefix: businesses.purchaseReturnPrefix,
+    counter: businesses.nextPurchaseReturnNumber,
+    setCounter: (n: number) => ({ nextPurchaseReturnNumber: n }),
+  },
+} as const;
+
+type KnownDocType = keyof typeof bizColumns;
+
+export function createDocumentRouter(config: DocumentRouterConfig) {
+  const docType = config.documentType;
+  const allowedStatusEnum = config.allowedStatuses as [string, ...string[]];
+
+  return router({
+    list: viewerProcedure
+      .input(
+        z.object({
+          type: z.enum(["sale", "purchase"]).optional(),
+          status: z.union([z.enum(allowedStatusEnum), z.array(z.enum(allowedStatusEnum))]).optional(),
+          partyId: z.string().uuid().optional(),
+          fromDate: z.string().datetime().optional(),
+          toDate: z.string().datetime().optional(),
+          search: z.string().optional(),
+          itemId: z.string().uuid().optional(),
+          ...paginationSchema.shape,
+        })
+      )
+      .query(async ({ input, ctx }) => {
+        requireCan(ctx.ability, "read", "Invoice");
+        const conditions = [
+          eq(invoices.businessId, ctx.businessId),
+          eq(invoices.documentType, docType as DocumentType),
+          isNull(invoices.deletedAt),
+        ];
+
+        if (input.type) conditions.push(eq(invoices.type, input.type));
+        if (input.status) {
+          if (Array.isArray(input.status)) {
+            conditions.push(inArray(invoices.status, input.status as InvoiceStatus[]));
+          } else {
+            conditions.push(eq(invoices.status, input.status as InvoiceStatus));
+          }
+        }
+        if (input.partyId) conditions.push(eq(invoices.partyId, input.partyId));
+        conditions.push(...buildBusinessDateFilter(invoices, { from: input.fromDate, to: input.toDate }));
+
+        const offset = (input.page - 1) * input.limit;
+
+        // If itemId filter: use EXISTS subquery instead of loading IDs into memory
+        if (input.itemId) {
+          conditions.push(
+            sql`EXISTS (SELECT 1 FROM ${invoiceItems} WHERE ${invoiceItems.invoiceId} = ${invoices.id} AND ${invoiceItems.itemId} = ${input.itemId})`
+          );
+        }
+
+        const [data, [{ count }]] = await Promise.all([
+          ctx.db
+            .select({
+              id: invoices.id,
+              invoiceNumber: invoices.invoiceNumber,
+              type: invoices.type,
+              status: invoices.status,
+              documentType: invoices.documentType,
+              invoiceDate: invoices.invoiceDate,
+              dueDate: invoices.dueDate,
+              totalAmount: invoices.totalAmount,
+              amountPaid: invoices.amountPaid,
+              referenceDocumentId: invoices.referenceDocumentId,
+              partyName: parties.name,
+              partyId: parties.id,
+            })
+            .from(invoices)
+            .innerJoin(parties, eq(parties.id, invoices.partyId))
+            .where(and(...conditions))
+            .orderBy(desc(invoices.createdAt))
+            .limit(input.limit)
+            .offset(offset),
+          ctx.db
+            .select({ count: sql<number>`count(*)::int` })
+            .from(invoices)
+            .where(and(...conditions)),
+        ]);
+
+        return { data, total: count, page: input.page, limit: input.limit };
+      }),
+
+    getById: viewerProcedure
+      .input(z.object({ id: z.string().uuid() }))
+      .query(async ({ input, ctx }) => {
+        requireCan(ctx.ability, "read", "Invoice");
+        const [invoice] = await ctx.db
+          .select()
+          .from(invoices)
+          .where(
+            and(
+              eq(invoices.id, input.id),
+              eq(invoices.businessId, ctx.businessId),
+              eq(invoices.documentType, docType as DocumentType)
+            )
+          )
+          .limit(1);
+
+        if (!invoice) return null;
+
+        const [lineItems, [party]] = await Promise.all([
+          ctx.db
+            .select()
+            .from(invoiceItems)
+            .where(eq(invoiceItems.invoiceId, input.id))
+            .orderBy(invoiceItems.sortOrder),
+          ctx.db.select().from(parties).where(eq(parties.id, invoice.partyId)).limit(1),
+        ]);
+
+        return { ...invoice, lineItems, party: party ?? null };
+      }),
+
+    create: memberProcedure
+      .input(createInvoiceSchema)
+      .mutation(async ({ input, ctx }) => {
+        // Documents are Invoice-backed; same permission as the invoice router.
+        requireCan(ctx.ability, "create", "Invoice");
+        if (!canCreateDocumentType(ctx.role, docType, input.type)) {
+          throw new TRPCError({ code: "FORBIDDEN", message: SELLER_PURCHASE_DENIED_MESSAGE });
+        }
+        const doc = await ctx.db.transaction(async (tx) => {
+          // Security: validate that partyId belongs to the current business.
+          const [partyCheck] = await tx.select({ id: parties.id })
+            .from(parties)
+            .where(and(eq(parties.id, input.partyId), eq(parties.businessId, ctx.businessId)))
+            .limit(1);
+          if (!partyCheck) {
+            throw new TRPCError({ code: "BAD_REQUEST", message: "Party not found in this business" });
+          }
+
+          // Security: validate that every itemId in line items belongs to the current business.
+          // Soft-delete note: mirrors `invoice.ts` — this is an ownership
+          // check, not an active-state check. Allowing soft-deleted items
+          // keeps backdated document creation (CLI, imports, historical
+          // re-entry) functional.
+          const createLineItemIds = input.lineItems
+            .map((li) => li.itemId)
+            .filter((id): id is string => Boolean(id));
+          if (createLineItemIds.length > 0) {
+            const ownedItems = await tx.select({ id: items.id })
+              .from(items)
+              .where(and(inArray(items.id, createLineItemIds), eq(items.businessId, ctx.businessId)));
+            if (ownedItems.length !== new Set(createLineItemIds).size) {
+              throw new TRPCError({ code: "BAD_REQUEST", message: "One or more items do not belong to this business" });
+            }
+          }
+
+          // Determine prefix/counter columns for this document type
+          const cols = bizColumns[docType as KnownDocType];
+
+          let docNumber: string;
+
+          if (cols) {
+            // Atomic counter increment with FOR UPDATE lock
+            const [biz] = await tx
+              .select({
+                prefix: cols.prefix,
+                counter: cols.counter,
+              })
+              .from(businesses)
+              .where(eq(businesses.id, ctx.businessId))
+              .for("update");
+
+            docNumber = `${biz.prefix}-${String(biz.counter).padStart(5, "0")}`;
+
+            await tx
+              .update(businesses)
+              .set(cols.setCounter((biz.counter as number) + 1))
+              .where(eq(businesses.id, ctx.businessId));
+          } else {
+            // Fallback: derive number from MAX of existing documents of this type
+            await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${ctx.businessId} || ':' || ${docType} || '_number'))`);
+            const [maxRow] = await tx
+              .select({
+                maxNum: sql<number>`coalesce(max(cast(regexp_replace(${invoices.invoiceNumber}, '[^0-9]', '', 'g') as integer)), 0)`,
+              })
+              .from(invoices)
+              .where(
+                and(
+                  eq(invoices.businessId, ctx.businessId),
+                  eq(invoices.documentType, docType as DocumentType)
+                )
+              );
+            const nextNum = (maxRow?.maxNum ?? 0) + 1;
+            const prefix = docType.toUpperCase().replace(/_/g, "").slice(0, 4);
+            docNumber = `${prefix}-${String(nextNum).padStart(5, "0")}`;
+          }
+
+          // Calculate line item totals using fixed-point arithmetic
+          const processedItems = input.lineItems.map((li, idx) => {
+            const calc = calcLineItem({
+              quantity: li.quantity,
+              unitPrice: li.unitPrice,
+              taxPercent: li.taxPercent || "0",
+              discountPercent: li.discountPercent || "0",
+            });
+            return {
+              itemId: li.itemId || null,
+              // Persist the variant so cancel/delete can restore variant stock
+              variantId: li.variantId || null,
+              itemName: li.itemName,
+              description: li.description || null,
+              quantity: li.quantity,
+              unitPrice: li.unitPrice,
+              taxPercent: li.taxPercent || "0",
+              taxAmount: calc.taxAmount,
+              discountPercent: li.discountPercent || "0",
+              totalAmount: calc.total,
+              sortOrder: idx,
+              selectedUnit: li.selectedUnit || null,
+              conversionFactor: li.conversionFactor || "1",
+            };
+          });
+
+          const charges = input.charges ?? [];
+          const totals = calcInvoiceTotals({
+            lineItems: input.lineItems.map((li) => ({
+              quantity: li.quantity,
+              unitPrice: li.unitPrice,
+              taxPercent: li.taxPercent || "0",
+              discountPercent: li.discountPercent || "0",
+            })),
+            charges: charges.length > 0 ? charges : undefined,
+            roundOff: charges.length > 0 ? (input.roundOff || "0") : undefined,
+          });
+          const additionalCharges = charges.length > 0
+            ? totals.chargesTotal
+            : (input.additionalCharges || "0");
+          const roundOff = input.roundOff || "0";
+
+          // Server-side guard: CN/SR/PR total must not exceed the referenced invoice's total.
+          // This prevents over-crediting or over-returning against a single invoice.
+          if (
+            input.referenceDocumentId &&
+            ["credit_note", "sales_return", "purchase_return"].includes(docType)
+          ) {
+            const [refInvoice] = await tx
+              .select({ totalAmount: invoices.totalAmount })
+              .from(invoices)
+              .where(and(
+                eq(invoices.id, input.referenceDocumentId),
+                eq(invoices.businessId, ctx.businessId),
+              ))
+              .limit(1);
+
+            if (!refInvoice) {
+              throw new TRPCError({ code: "BAD_REQUEST", message: "Referenced invoice not found" });
+            }
+
+            // Sum all existing CN/SR/PR already issued against this invoice
+            const [{ alreadyAdjusted }] = await tx
+              .select({
+                alreadyAdjusted: sql<string>`COALESCE(SUM(${invoices.totalAmount}::numeric), 0)`,
+              })
+              .from(invoices)
+              .where(and(
+                eq(invoices.referenceDocumentId, input.referenceDocumentId),
+                eq(invoices.businessId, ctx.businessId),
+                sql`${invoices.documentType} IN ('credit_note', 'sales_return', 'purchase_return')`,
+                sql`${invoices.status} NOT IN ('cancelled')`,
+                isNull(invoices.deletedAt),
+              ));
+
+            const remaining = parseFloat(refInvoice.totalAmount) - parseFloat(alreadyAdjusted);
+            if (parseFloat(totals.total) > remaining + 0.01) { // 0.01 tolerance for rounding
+              throw new TRPCError({
+                code: "BAD_REQUEST",
+                message: `Amount exceeds remaining adjustable amount. Invoice total: ${refInvoice.totalAmount}, already adjusted: ${alreadyAdjusted}, remaining: ${remaining.toFixed(2)}, attempted: ${totals.total}`,
+              });
+            }
+          }
+
+          const [result] = await tx
+            .insert(invoices)
+            .values({
+              businessId: ctx.businessId,
+              partyId: input.partyId,
+              type: input.type,
+              // ALWAYS use config.documentType — never trust client-supplied value
+              documentType: docType as DocumentType,
+              invoiceNumber: docNumber,
+              invoiceDate: input.invoiceDate ? new Date(input.invoiceDate) : new Date(),
+              dueDate: input.dueDate ? new Date(input.dueDate) : null,
+              subtotal: totals.subtotal,
+              taxAmount: totals.taxTotal,
+              discountAmount: "0.00",
+              charges: charges.length > 0 ? charges : null,
+              additionalCharges,
+              roundOff,
+              totalAmount: totals.total,
+              notes: input.notes,
+              termsAndConditions: input.termsAndConditions,
+              referenceDocumentId: input.referenceDocumentId || null,
+              createdByUserId: ctx.user!.id,
+              createdByName: ctx.user!.name,
+            })
+            .returning();
+
+          if (processedItems.length > 0) {
+            await tx
+              .insert(invoiceItems)
+              .values(processedItems.map((li) => ({ ...li, invoiceId: result.id })));
+          }
+
+          // Stock effects (adjusted for unit conversion). Deltas are grouped per
+          // item/variant and applied in one batched NUMERIC UPDATE per table.
+          // skipStockAdjustment lets callers (e.g. challan→invoice conversion) opt out.
+          if (config.stockEffect !== "none" && !input.skipStockAdjustment) {
+            await applyStockDeltas(
+              tx,
+              input.lineItems.map((li) => ({ ...li, sign: config.stockEffect === "decrement" ? -1 : 1 })),
+              { businessId: ctx.businessId },
+            );
+          }
+
+          // Auto-update referenced invoice status to "adjusted" when fully covered
+          if (
+            input.referenceDocumentId &&
+            ["credit_note", "sales_return", "purchase_return"].includes(docType)
+          ) {
+            const [{ totalAdj }] = await tx
+              .select({
+                totalAdj: sql<string>`COALESCE(SUM(${invoices.totalAmount}::numeric), 0)`,
+              })
+              .from(invoices)
+              .where(and(
+                eq(invoices.referenceDocumentId, input.referenceDocumentId),
+                eq(invoices.businessId, ctx.businessId),
+                sql`${invoices.documentType} IN ('credit_note', 'sales_return', 'purchase_return')`,
+                sql`${invoices.status} NOT IN ('cancelled')`,
+                isNull(invoices.deletedAt),
+              ));
+
+            const [{ refTotal }] = await tx
+              .select({ refTotal: invoices.totalAmount })
+              .from(invoices)
+              .where(eq(invoices.id, input.referenceDocumentId))
+              .limit(1);
+
+            if (parseFloat(totalAdj) >= parseFloat(refTotal) - 0.01) {
+              await tx
+                .update(invoices)
+                .set({ status: "adjusted", updatedAt: new Date() })
+                .where(eq(invoices.id, input.referenceDocumentId));
+            }
+          }
+
+          return result;
+        });
+
+        logAudit(ctx.db, {
+          businessId: ctx.businessId,
+          userId: ctx.user!.id,
+          action: `${config.documentType}.create`,
+          entityType: config.documentType,
+          entityId: doc.id,
+          metadata: { invoiceNumber: doc.invoiceNumber, type: config.documentType },
+          ipAddress: ctx.ipAddress,
+        });
+
+        return doc;
+      }),
+
+    updateStatus: memberProcedure
+      .input(
+        z.object({
+          id: z.string().uuid(),
+          status: z.enum(allowedStatusEnum),
+        })
+      )
+      .mutation(async ({ input, ctx }) => {
+        // Documents are Invoice-backed; same permission as the invoice router.
+        requireCan(ctx.ability, "update", "Invoice");
+        const doc = await ctx.db.transaction(async (tx) => {
+          const [before] = await tx
+            .select()
+            .from(invoices)
+            .where(
+              and(
+                eq(invoices.id, input.id),
+                eq(invoices.businessId, ctx.businessId),
+                eq(invoices.documentType, docType as DocumentType),
+                isNull(invoices.deletedAt)
+              )
+            )
+            .for("update")
+            .limit(1);
+
+          if (!before) {
+            throw new TRPCError({ code: "NOT_FOUND", message: "Document not found" });
+          }
+
+          const transitionError = checkDocumentStatusTransition(docType, before.status, input.status);
+          if (transitionError) {
+            throw new TRPCError({ code: "BAD_REQUEST", message: transitionError });
+          }
+          if (before.status === input.status) return { ...before, fromStatus: before.status };
+
+          if (input.status === "cancelled") {
+            await assertNoPaymentsOrActiveIrn(tx, "cancel", before);
+            // Cancel undoes the stock effect exactly like delete (once: the
+            // before.status === input.status early-return above and the
+            // transition check prevent re-cancelling, and delete skips
+            // cancelled docs).
+            await reverseDocumentStockEffect(tx, ctx.businessId, before.id, config.stockEffect);
+          }
+
+          const [updated] = await tx
+            .update(invoices)
+            .set({ status: input.status as InvoiceStatus, updatedAt: new Date() })
+            .where(and(eq(invoices.id, input.id), eq(invoices.businessId, ctx.businessId)))
+            .returning();
+          return { ...updated, fromStatus: before.status };
+        });
+
+        logAudit(ctx.db, {
+          businessId: ctx.businessId,
+          userId: ctx.user!.id,
+          action: `${config.documentType}.updateStatus`,
+          entityType: config.documentType,
+          entityId: input.id,
+          metadata: { invoiceNumber: doc.invoiceNumber, fromStatus: doc.fromStatus, toStatus: input.status },
+          ipAddress: ctx.ipAddress,
+        });
+
+        const { fromStatus: _from, ...result } = doc;
+        return result;
+      }),
+
+    delete: adminProcedure
+      .input(z.object({ id: z.string().uuid() }))
+      .mutation(async ({ input, ctx }) => {
+        // Documents are Invoice-backed; same permission as the invoice router.
+        requireCan(ctx.ability, "delete", "Invoice");
+        const deleteResult = await ctx.db.transaction(async (tx) => {
+          const [doc] = await tx
+            .select()
+            .from(invoices)
+            .where(
+              and(
+                eq(invoices.id, input.id),
+                eq(invoices.businessId, ctx.businessId),
+                eq(invoices.documentType, docType as DocumentType)
+              )
+            )
+            .for("update")
+            .limit(1);
+
+          if (!doc) {
+            throw new TRPCError({ code: "NOT_FOUND", message: "Document not found" });
+          }
+
+          // Already soft-deleted — return early
+          if (doc.deletedAt) return { success: true, invoiceNumber: doc.invoiceNumber, deleted: false };
+
+          await assertNoPaymentsOrActiveIrn(tx, "delete", doc);
+
+          // Same record-level rule as invoice.delete (seller_manager: unpaid, within 2 hours)
+          const verdict = checkInvoiceDeleteAllowed(ctx.role, { status: doc.status, createdAt: doc.createdAt });
+          if (!verdict.allowed) throw new TRPCError({ code: "FORBIDDEN", message: verdict.message });
+
+          // Reverse stock effects on delete (using stored conversionFactor).
+          // A cancelled document already had its stock reversed when it was
+          // cancelled — don't reverse twice.
+          if (doc.status !== "cancelled") {
+            await reverseDocumentStockEffect(tx, ctx.businessId, doc.id, config.stockEffect);
+          }
+
+          // Soft delete: set deletedAt + cancel the document
+          await tx
+            .update(invoices)
+            .set({ deletedAt: new Date(), status: "cancelled" as const, updatedAt: new Date() })
+            .where(
+              and(
+                eq(invoices.id, input.id),
+                eq(invoices.businessId, ctx.businessId)
+              )
+            );
+
+          return { success: true, invoiceNumber: doc.invoiceNumber, deleted: true };
+        });
+
+        if (deleteResult.deleted) {
+          logAudit(ctx.db, {
+            businessId: ctx.businessId,
+            userId: ctx.user!.id,
+            action: `${config.documentType}.delete`,
+            entityType: config.documentType,
+            entityId: input.id,
+            metadata: { invoiceNumber: deleteResult.invoiceNumber },
+            ipAddress: ctx.ipAddress,
+          });
+        }
+
+        return { success: deleteResult.success };
+      }),
+  });
+}
